@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -34,6 +35,10 @@ Usage:
       -desc string       description
       -bindings string   JSON file with bindings; suggested automatically when omitted
   comfyvault suggest <workflow.json>       print suggested bindings as JSON
+  comfyvault prune [flags]                 delete old finished runs and their images
+      -older-than string  minimum age, e.g. 12h, 30d, 2w (required)
+      -dry-run            only report what would be deleted
+      -include-favorites  also delete runs marked as favorite
   comfyvault version
 
 Configuration comes from the environment or a .env file; see .env.example.
@@ -58,6 +63,8 @@ func run(args []string) error {
 		return importCmd(args)
 	case "suggest":
 		return suggestCmd(args)
+	case "prune":
+		return pruneCmd(args)
 	case "version":
 		fmt.Println("comfyvault", version)
 		return nil
@@ -193,4 +200,58 @@ func suggestCmd(args []string) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(workflow.Suggest(g))
+}
+
+func pruneCmd(args []string) error {
+	fs := flag.NewFlagSet("prune", flag.ContinueOnError)
+	older := fs.String("older-than", "", "minimum age of the runs to delete (12h, 30d, 2w)")
+	dry := fs.Bool("dry-run", false, "only report what would be deleted")
+	favs := fs.Bool("include-favorites", false, "also delete runs marked as favorite")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *older == "" || fs.NArg() != 0 {
+		return errors.New("usage: comfyvault prune -older-than <age> [-dry-run] [-include-favorites]")
+	}
+	age, err := parseAge(*older)
+	if err != nil {
+		return err
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	st, err := store.Open(cfg.DataDir)
+	if err != nil {
+		return err
+	}
+	removed, freed, err := st.Prune(time.Now().UTC().Add(-age), *favs, *dry)
+	if err != nil {
+		return err
+	}
+	verb := "deleted"
+	if *dry {
+		verb = "would delete"
+	}
+	fmt.Printf("%s %d run(s), %.1f MiB\n", verb, len(removed), float64(freed)/(1<<20))
+	return nil
+}
+
+// parseAge accepts Go durations plus d (days) and w (weeks) suffixes.
+func parseAge(s string) (time.Duration, error) {
+	if len(s) > 1 {
+		unit := map[byte]time.Duration{'d': 24 * time.Hour, 'w': 7 * 24 * time.Hour}
+		if u, ok := unit[s[len(s)-1]]; ok {
+			n, err := strconv.Atoi(s[:len(s)-1])
+			if err != nil || n < 0 {
+				return 0, fmt.Errorf("invalid age %q (try 30d, 2w or 12h)", s)
+			}
+			return time.Duration(n) * u, nil
+		}
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("invalid age %q (try 30d, 2w or 12h)", s)
+	}
+	return d, nil
 }

@@ -128,12 +128,48 @@ est tiré au hasard, et la valeur utilisée est enregistrée dans le run.
     curl -s localhost:8080/api/v1/runs/<id>
     curl -s -o image.png localhost:8080/api/v1/runs/<id>/outputs/<nom-du-fichier>
 
-Statuts d'un run : `queued`, `running`, `succeeded`, `failed`. Si ComfyUI refuse
+Statuts d'un run : `queued`, `running`, `succeeded`, `failed`, `cancelled`. Si ComfyUI refuse
 le workflow (modèle absent, valeur invalide), l'erreur de ComfyUI est renvoyée
 telle quelle dans la réponse du `POST .../run`, avec le détail par nœud.
 
 Avant de lancer, `GET /api/v1/workflows/<slug>/check` compare les nœuds du
 workflow à ceux installés dans ton ComfyUI et liste ceux qui manquent.
+
+### 5. Annuler, rejouer, lancer en série
+
+```
+# annuler un run en attente (retiré de la file) ou en cours (interrompu)
+curl -s -X POST localhost:8080/api/v1/runs/<id>/cancel
+
+# rejouer un run à l'identique (même version de workflow, même seed)
+curl -s -X POST localhost:8080/api/v1/runs/<id>/replay
+# ... ou avec une nouvelle seed et un paramètre modifié
+curl -s -X POST localhost:8080/api/v1/runs/<id>/replay -d '{"new_seed": true, "params": {"steps": 40}}'
+
+# lot : produit cartésien de la grille, chaque combinaison répétée `count` fois
+curl -s -X POST localhost:8080/api/v1/workflows/txt2img/batch -d '{
+  "positive": {"preset": "portrait", "vars": {"hair": "silver", "outfit": "kimono"}},
+  "grid":     {"steps": [20, 30], "cfg": [5, 7]},
+  "count":    2
+}'
+```
+
+Un lot est limité à 64 runs. Sans seed fournie, chaque run tire la sienne ; si tu
+fixes une seed dans `params`, les répétitions seront identiques. La réponse
+contient un `batch_id` à passer à `GET /api/v1/runs?batch=<id>`. Si ComfyUI
+refuse un run au milieu du lot, les runs déjà lancés restent actifs et la
+réponse indique `failed_at`.
+
+Une fois un run terminé, on peut l'annoter :
+
+```
+curl -s -X PATCH localhost:8080/api/v1/runs/<id> -d '{"tags": ["portrait", "keep"], "favorite": true, "note": "belles mains"}'
+curl -s 'localhost:8080/api/v1/runs?tag=portrait&favorite=true&since=2026-11-01T00:00:00Z'
+```
+
+Pour libérer de la place : `./bin/comfyvault prune -older-than 30d -dry-run`
+(puis sans `-dry-run`). Seuls les runs terminés sont supprimés, les favoris sont
+conservés sauf avec `-include-favorites`.
 
 ## Bindings personnalisés
 
@@ -183,8 +219,12 @@ complète des variables manquantes. Un bloc utilisé par un preset ne peut pas
 | `GET, POST /api/v1/presets` | lister, créer |
 | `GET, PUT, DELETE /api/v1/presets/{id}` | lire, modifier, supprimer |
 | `POST /api/v1/prompts/render` | assemble un prompt sans lancer de run |
-| `GET /api/v1/runs` | historique ; `?workflow=slug`, `?limit=N` |
+| `POST /api/v1/workflows/{slug}/batch` | lot de runs : `params`, `positive`, `negative`, `grid`, `count` |
+| `GET /api/v1/runs` | historique ; `?workflow=`, `?status=`, `?batch=`, `?tag=`, `?favorite=true`, `?since=` (RFC 3339), `?limit=N` |
 | `GET /api/v1/runs/{id}` | statut, paramètres résolus, erreur éventuelle |
+| `PATCH /api/v1/runs/{id}` | `tags`, `favorite`, `note` (run terminé uniquement) |
+| `POST /api/v1/runs/{id}/cancel` | annule un run en attente ou en cours |
+| `POST /api/v1/runs/{id}/replay` | relance avec les mêmes paramètres ; `params`, `new_seed` optionnels |
 | `GET /api/v1/runs/{id}/outputs/{name}` | télécharge un fichier produit |
 
 Les corps de requête sont lus strictement : un champ inconnu renvoie une 400
@@ -217,7 +257,11 @@ sont ignorés.
 - Le suivi d'un run interroge `/history` et `/queue` à intervalle fixe au lieu
   d'écouter le WebSocket de ComfyUI. Il n'y a donc pas de pourcentage
   d'avancement, seulement l'état (`queued`, `running`, terminé).
-- Pas d'annulation de run pour l'instant.
+- L'annulation d'un run en cours passe par `/interrupt` de ComfyUI : les versions
+  récentes n'interrompent que le prompt visé, les anciennes interrompent ce qui
+  tourne à cet instant.
+- Les annotations (`tags`, `favorite`, `note`) ne se modifient que sur un run
+  terminé, pour ne pas entrer en concurrence avec le suivi en arrière-plan.
 - Le JSON du workflow est normalisé au stockage (clés triées) ; les champs de
   nœud autres que `class_type`, `inputs` et `_meta` ne sont pas conservés.
 - Pas d'interface web : tout passe par l'API et la CLI.

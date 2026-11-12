@@ -216,6 +216,7 @@ const (
 	StatusRunning   = "running"
 	StatusSucceeded = "succeeded"
 	StatusFailed    = "failed"
+	StatusCancelled = "cancelled"
 )
 
 type Output struct {
@@ -235,6 +236,19 @@ type Run struct {
 	Outputs    []Output       `json:"outputs,omitempty"`
 	CreatedAt  time.Time      `json:"created_at"`
 	FinishedAt *time.Time     `json:"finished_at,omitempty"`
+
+	// ReplayOf and BatchID say where the run came from; Tags, Favorite and
+	// Note are filled in by the user once the run has finished.
+	ReplayOf string   `json:"replay_of,omitempty"`
+	BatchID  string   `json:"batch_id,omitempty"`
+	Tags     []string `json:"tags,omitempty"`
+	Favorite bool     `json:"favorite,omitempty"`
+	Note     string   `json:"note,omitempty"`
+}
+
+// Finished reports whether the run reached a final status.
+func (r Run) Finished() bool {
+	return r.Status == StatusSucceeded || r.Status == StatusFailed || r.Status == StatusCancelled
 }
 
 func NewRunID() string {

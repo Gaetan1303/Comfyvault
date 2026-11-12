@@ -243,3 +243,15 @@ func (c *Client) View(ctx context.Context, ref FileRef) (io.ReadCloser, error) {
 	}
 	return resp.Body, nil
 }
+
+// Interrupt stops the prompt that is executing right now. Recent ComfyUI
+// versions only interrupt the given prompt; older ones ignore the body and
+// interrupt whatever is running.
+func (c *Client) Interrupt(ctx context.Context, promptID string) error {
+	return c.do(ctx, http.MethodPost, "/interrupt", map[string]string{"prompt_id": promptID}, nil, 10*time.Second)
+}
+
+// DeleteQueued removes a pending prompt from ComfyUI's queue.
+func (c *Client) DeleteQueued(ctx context.Context, promptID string) error {
+	return c.do(ctx, http.MethodPost, "/queue", map[string]any{"delete": []string{promptID}}, nil, 10*time.Second)
+}

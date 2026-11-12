@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"path/filepath"
@@ -45,6 +46,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/workflows/{slug}", s.getWorkflow)
 	mux.HandleFunc("GET /api/v1/workflows/{slug}/check", s.checkWorkflow)
 	mux.HandleFunc("POST /api/v1/workflows/{slug}/run", s.runWorkflow)
+	mux.HandleFunc("POST /api/v1/workflows/{slug}/batch", s.batchWorkflow)
 
 	mux.HandleFunc("POST /api/v1/prompts/render", s.renderPrompt)
 
@@ -79,6 +81,9 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/v1/runs", s.listRuns)
 	mux.HandleFunc("GET /api/v1/runs/{id}", s.getRun)
+	mux.HandleFunc("PATCH /api/v1/runs/{id}", s.patchRun)
+	mux.HandleFunc("POST /api/v1/runs/{id}/cancel", s.cancelRun)
+	mux.HandleFunc("POST /api/v1/runs/{id}/replay", s.replayRun)
 	mux.HandleFunc("GET /api/v1/runs/{id}/outputs/{name}", s.getOutput)
 
 	return s.auth(mux)
@@ -121,6 +126,17 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
+		return false
+	}
+	return true
+}
+
+// decodeOptional is decode for endpoints whose body may be left out.
+func decodeOptional(w http.ResponseWriter, r *http.Request, v any) bool {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return false
 	}
@@ -345,6 +361,32 @@ func (s *Server) renderPrompt(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"text": text})
 }
 
+// buildParams merges explicit params with the prompts assembled from blocks.
+func (s *Server) buildParams(base map[string]any, positive, negative *promptRef) (map[string]any, error) {
+	params := make(map[string]any, len(base)+2)
+	for k, v := range base {
+		params[k] = v
+	}
+	refs := []struct {
+		name string
+		ref  *promptRef
+	}{{"positive", positive}, {"negative", negative}}
+	for _, e := range refs {
+		if e.ref == nil {
+			continue
+		}
+		if _, dup := params[e.name]; dup {
+			return nil, invalid("%q is set both in params and as a prompt reference", e.name)
+		}
+		text, err := s.resolvePrompt(*e.ref)
+		if err != nil {
+			return nil, err
+		}
+		params[e.name] = text
+	}
+	return params, nil
+}
+
 func (s *Server) runWorkflow(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Version  int            `json:"version"`
@@ -355,24 +397,10 @@ func (s *Server) runWorkflow(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	params := map[string]any{}
-	for k, v := range req.Params {
-		params[k] = v
-	}
-	for name, ref := range map[string]*promptRef{"positive": req.Positive, "negative": req.Negative} {
-		if ref == nil {
-			continue
-		}
-		if _, dup := params[name]; dup {
-			s.fail(w, invalid("%q is set both in params and as a prompt reference", name))
-			return
-		}
-		text, err := s.resolvePrompt(*ref)
-		if err != nil {
-			s.fail(w, err)
-			return
-		}
-		params[name] = text
+	params, err := s.buildParams(req.Params, req.Positive, req.Negative)
+	if err != nil {
+		s.fail(w, err)
+		return
 	}
 	run, err := s.rn.Submit(r.Context(), r.PathValue("slug"), req.Version, params)
 	if err != nil {
@@ -383,27 +411,250 @@ func (s *Server) runWorkflow(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, run)
 }
 
+const maxBatch = 64
+
+// batchWorkflow queues several runs of one workflow: the cartesian product of
+// the grid values, each repeated count times. Seeds left unset are drawn at
+// random for every run, so count > 1 gives different images.
+func (s *Server) batchWorkflow(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Version  int              `json:"version"`
+		Params   map[string]any   `json:"params"`
+		Positive *promptRef       `json:"positive"`
+		Negative *promptRef       `json:"negative"`
+		Grid     map[string][]any `json:"grid"`
+		Count    int              `json:"count"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	count := req.Count
+	if count == 0 {
+		count = 1
+	}
+	if count < 0 {
+		s.fail(w, invalid("count must be positive"))
+		return
+	}
+	base, err := s.buildParams(req.Params, req.Positive, req.Negative)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+
+	names := make([]string, 0, len(req.Grid))
+	for k := range req.Grid {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	combos := []map[string]any{{}}
+	for _, k := range names {
+		values := req.Grid[k]
+		if len(values) == 0 {
+			s.fail(w, invalid("grid %q has no values", k))
+			return
+		}
+		if _, dup := base[k]; dup {
+			s.fail(w, invalid("%q is set both in the grid and in params or prompts", k))
+			return
+		}
+		if len(combos)*len(values) > maxBatch {
+			s.fail(w, invalid("a batch is limited to %d runs", maxBatch))
+			return
+		}
+		next := make([]map[string]any, 0, len(combos)*len(values))
+		for _, c := range combos {
+			for _, v := range values {
+				m := make(map[string]any, len(c)+1)
+				for ck, cv := range c {
+					m[ck] = cv
+				}
+				m[k] = v
+				next = append(next, m)
+			}
+		}
+		combos = next
+	}
+	if total := len(combos) * count; total > maxBatch {
+		s.fail(w, invalid("a batch is limited to %d runs (this one would make %d)", maxBatch, total))
+		return
+	}
+
+	batchID := store.NewRunID()
+	runs := make([]store.Run, 0, len(combos)*count)
+	for _, combo := range combos {
+		for i := 0; i < count; i++ {
+			params := make(map[string]any, len(base)+len(combo))
+			for k, v := range base {
+				params[k] = v
+			}
+			for k, v := range combo {
+				params[k] = v
+			}
+			run, err := s.rn.SubmitWith(r.Context(), r.PathValue("slug"), req.Version, params, runner.Meta{BatchID: batchID})
+			if err != nil {
+				if len(runs) == 0 {
+					s.fail(w, err)
+					return
+				}
+				// Part of the batch is already queued: report both.
+				s.log.Warn("batch stopped early", "batch", batchID, "submitted", len(runs), "err", err)
+				writeJSON(w, http.StatusAccepted, map[string]any{
+					"batch_id": batchID, "count": len(runs), "runs": runs,
+					"error": err.Error(), "failed_at": len(runs),
+				})
+				return
+			}
+			runs = append(runs, run)
+		}
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"batch_id": batchID, "count": len(runs), "runs": runs})
+}
+
 // Runs
 
 func (s *Server) listRuns(w http.ResponseWriter, r *http.Request) {
-	limit := 50
-	if v := r.URL.Query().Get("limit"); v != "" {
+	q := r.URL.Query()
+	f := store.RunFilter{
+		Workflow: q.Get("workflow"),
+		Status:   q.Get("status"),
+		Batch:    q.Get("batch"),
+		Tag:      strings.ToLower(q.Get("tag")),
+		Limit:    50,
+	}
+	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > 500 {
 			writeError(w, http.StatusBadRequest, "limit must be between 1 and 500")
 			return
 		}
-		limit = n
+		f.Limit = n
 	}
-	runs, err := s.st.ListRuns(r.URL.Query().Get("workflow"), limit)
+	switch f.Status {
+	case "", store.StatusQueued, store.StatusRunning, store.StatusSucceeded, store.StatusFailed, store.StatusCancelled:
+	default:
+		writeError(w, http.StatusBadRequest, "status must be queued, running, succeeded, failed or cancelled")
+		return
+	}
+	if v := q.Get("favorite"); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "favorite must be true or false")
+			return
+		}
+		f.Favorite = b
+	}
+	if v := q.Get("since"); v != "" {
+		t, err := time.Parse(time.RFC3339, v)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "since must be an RFC 3339 timestamp, e.g. 2026-01-31T00:00:00Z")
+			return
+		}
+		f.Since = t
+	}
+	runs, err := s.st.FilterRuns(f)
 	if err != nil {
 		s.fail(w, err)
 		return
 	}
-	if runs == nil {
-		runs = []store.Run{}
-	}
 	writeJSON(w, http.StatusOK, runs)
+}
+
+func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
+	run, err := s.rn.Cancel(r.Context(), r.PathValue("id"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
+}
+
+// replayRun queues the same workflow version with the exact parameters of an
+// earlier run (seed included). params overrides single values; new_seed draws
+// a fresh seed instead of reusing the old one.
+func (s *Server) replayRun(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Params  map[string]any `json:"params"`
+		NewSeed bool           `json:"new_seed"`
+	}
+	if !decodeOptional(w, r, &req) {
+		return
+	}
+	orig, err := s.st.GetRun(r.PathValue("id"))
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	wf, err := s.st.GetWorkflow(orig.Workflow)
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	v, ok := wf.Get(orig.Version)
+	if !ok {
+		s.fail(w, fmt.Errorf("%w: workflow %q has no version %d", store.ErrNotFound, wf.Slug, orig.Version))
+		return
+	}
+	params := make(map[string]any, len(orig.Params))
+	for k, val := range orig.Params {
+		params[k] = val
+	}
+	if req.NewSeed {
+		for _, b := range v.Bindings {
+			if b.Type == workflow.TypeSeed {
+				params[b.Name] = -1
+			}
+		}
+	}
+	for k, val := range req.Params {
+		params[k] = val
+	}
+	run, err := s.rn.SubmitWith(r.Context(), orig.Workflow, orig.Version, params, runner.Meta{ReplayOf: orig.ID})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	w.Header().Set("Location", "/api/v1/runs/"+run.ID)
+	writeJSON(w, http.StatusAccepted, run)
+}
+
+// patchRun edits the user-owned fields of a finished run.
+func (s *Server) patchRun(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Tags     *[]string `json:"tags"`
+		Favorite *bool     `json:"favorite"`
+		Note     *string   `json:"note"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	run, err := s.st.UpdateRun(r.PathValue("id"), func(run *store.Run) error {
+		if !run.Finished() {
+			return fmt.Errorf("%w: run %s is still %s; annotate it once it has finished", store.ErrExists, run.ID, run.Status)
+		}
+		if req.Tags != nil {
+			tags, err := store.NormalizeTags(*req.Tags)
+			if err != nil {
+				return invalid("%v", err)
+			}
+			run.Tags = tags
+		}
+		if req.Favorite != nil {
+			run.Favorite = *req.Favorite
+		}
+		if req.Note != nil {
+			if len(*req.Note) > 2000 {
+				return invalid("note is limited to 2000 bytes")
+			}
+			run.Note = *req.Note
+		}
+		return nil
+	})
+	if err != nil {
+		s.fail(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, run)
 }
 
 func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {

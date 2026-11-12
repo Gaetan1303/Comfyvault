@@ -29,6 +29,11 @@ type fakeComfy struct {
 	}
 	polls    int
 	rejectAs string
+
+	hold       bool // history stays empty: the run never finishes
+	pending    bool // /queue reports the prompt as waiting instead of running
+	interrupts []string
+	deleted    []string
 }
 
 func (f *fakeComfy) handler() http.Handler {
@@ -58,8 +63,9 @@ func (f *fakeComfy) handler() http.Handler {
 		f.mu.Lock()
 		f.polls++
 		n := f.polls
+		hold := f.hold
 		f.mu.Unlock()
-		if n < 2 {
+		if hold || n < 2 {
 			io.WriteString(w, `{}`)
 			return
 		}
@@ -68,7 +74,32 @@ func (f *fakeComfy) handler() http.Handler {
 			           "10":{"images":[{"filename":"tmp.png","subfolder":"","type":"temp"}]}}}}`)
 	})
 	mux.HandleFunc("GET /queue", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		pending := f.pending
+		f.mu.Unlock()
+		if pending {
+			io.WriteString(w, `{"queue_running":[],"queue_pending":[[1,"p1",{}]]}`)
+			return
+		}
 		io.WriteString(w, `{"queue_running":[[0,"p1",{}]],"queue_pending":[]}`)
+	})
+	mux.HandleFunc("POST /queue", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Delete []string `json:"delete"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.deleted = append(f.deleted, body.Delete...)
+		f.mu.Unlock()
+	})
+	mux.HandleFunc("POST /interrupt", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			PromptID string `json:"prompt_id"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.interrupts = append(f.interrupts, body.PromptID)
+		f.mu.Unlock()
 	})
 	mux.HandleFunc("GET /view", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Query().Get("filename") != "out_00001_.png" {
@@ -249,4 +280,177 @@ func TestAPIKey(t *testing.T) {
 	if code, _ := h.call("GET", "/healthz", nil, ""); code != 200 {
 		t.Fatalf("healthz should stay open: got %d", code)
 	}
+}
+
+// waitDone polls a run until it reaches a final status.
+func (h *harness) waitDone(id string) store.Run {
+	h.t.Helper()
+	var run store.Run
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		json.Unmarshal(h.expect(200, "GET", "/api/v1/runs/"+id, nil), &run)
+		if run.Finished() {
+			return run
+		}
+		if time.Now().After(deadline) {
+			h.t.Fatalf("run %s did not finish: %+v", id, run)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (h *harness) startRun(params map[string]any) store.Run {
+	h.t.Helper()
+	var run store.Run
+	json.Unmarshal(h.expect(202, "POST", "/api/v1/workflows/w/run", map[string]any{"params": params}), &run)
+	return run
+}
+
+func TestCancelRun(t *testing.T) {
+	for _, pending := range []bool{false, true} {
+		name := "running"
+		if pending {
+			name = "pending"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, "")
+			h.fake.mu.Lock()
+			h.fake.hold, h.fake.pending = true, pending
+			h.fake.mu.Unlock()
+			h.expect(201, "POST", "/api/v1/workflows", map[string]any{"slug": "w", "api": exampleWorkflow(t)})
+
+			run := h.startRun(map[string]any{"positive": "x"})
+			h.expect(409, "PATCH", "/api/v1/runs/"+run.ID, map[string]any{"favorite": true}) // not finished yet
+
+			var got store.Run
+			json.Unmarshal(h.expect(200, "POST", "/api/v1/runs/"+run.ID+"/cancel", nil), &got)
+			if got.Status != store.StatusCancelled || got.FinishedAt == nil {
+				t.Fatalf("expected a cancelled run, got %+v", got)
+			}
+
+			h.fake.mu.Lock()
+			interrupts, deleted := len(h.fake.interrupts), len(h.fake.deleted)
+			h.fake.mu.Unlock()
+			if pending && (deleted != 1 || interrupts != 0) {
+				t.Fatalf("a queued prompt should be removed from the queue: deleted=%d interrupts=%d", deleted, interrupts)
+			}
+			if !pending && (interrupts != 1 || deleted != 0) {
+				t.Fatalf("a running prompt should be interrupted: deleted=%d interrupts=%d", deleted, interrupts)
+			}
+
+			h.expect(409, "POST", "/api/v1/runs/"+run.ID+"/cancel", nil) // already cancelled
+			h.expect(404, "POST", "/api/v1/runs/20000101-000000-abcdef/cancel", nil)
+		})
+	}
+}
+
+func TestReplayRun(t *testing.T) {
+	h := newHarness(t, "")
+	h.expect(201, "POST", "/api/v1/workflows", map[string]any{"slug": "w", "api": exampleWorkflow(t)})
+
+	first := h.startRun(map[string]any{"positive": "x", "steps": 12, "seed": 42})
+	h.waitDone(first.ID)
+
+	var same store.Run
+	json.Unmarshal(h.expect(202, "POST", "/api/v1/runs/"+first.ID+"/replay", nil), &same)
+	if same.ReplayOf != first.ID || same.Version != first.Version ||
+		same.Params["seed"] != float64(42) || same.Params["steps"] != float64(12) || same.Params["positive"] != "x" {
+		t.Fatalf("replay should reuse the exact parameters: %+v", same)
+	}
+
+	var varied store.Run
+	json.Unmarshal(h.expect(202, "POST", "/api/v1/runs/"+first.ID+"/replay",
+		map[string]any{"new_seed": true, "params": map[string]any{"steps": 20}}), &varied)
+	if varied.Params["seed"] == float64(42) || varied.Params["steps"] != float64(20) {
+		t.Fatalf("new_seed and overrides were not applied: %+v", varied.Params)
+	}
+
+	h.expect(400, "POST", "/api/v1/runs/"+first.ID+"/replay", map[string]any{"typo": true})
+	h.expect(422, "POST", "/api/v1/runs/"+first.ID+"/replay", map[string]any{"params": map[string]any{"nope": 1}})
+	h.expect(404, "POST", "/api/v1/runs/20000101-000000-abcdef/replay", nil)
+}
+
+func TestBatch(t *testing.T) {
+	h := newHarness(t, "")
+	h.expect(201, "POST", "/api/v1/workflows", map[string]any{"slug": "w", "api": exampleWorkflow(t)})
+
+	var out struct {
+		BatchID string      `json:"batch_id"`
+		Count   int         `json:"count"`
+		Runs    []store.Run `json:"runs"`
+	}
+	json.Unmarshal(h.expect(202, "POST", "/api/v1/workflows/w/batch", map[string]any{
+		"params": map[string]any{"positive": "x"},
+		"grid":   map[string]any{"steps": []int{10, 20}},
+		"count":  2,
+	}), &out)
+	if out.Count != 4 || len(out.Runs) != 4 || out.BatchID == "" {
+		t.Fatalf("expected 4 runs in one batch: %+v", out)
+	}
+	steps := map[float64]int{}
+	for _, r := range out.Runs {
+		if r.BatchID != out.BatchID {
+			t.Fatalf("run %s lost its batch id", r.ID)
+		}
+		steps[r.Params["steps"].(float64)]++
+	}
+	if steps[10] != 2 || steps[20] != 2 {
+		t.Fatalf("grid values were not spread over the runs: %v", steps)
+	}
+	if out.Runs[0].Params["seed"] == out.Runs[1].Params["seed"] {
+		t.Fatalf("repeated runs should get different random seeds")
+	}
+
+	for _, r := range out.Runs {
+		h.waitDone(r.ID)
+	}
+	var listed []store.Run
+	json.Unmarshal(h.expect(200, "GET", "/api/v1/runs?batch="+out.BatchID, nil), &listed)
+	if len(listed) != 4 {
+		t.Fatalf("batch filter: got %d runs", len(listed))
+	}
+
+	tooMany := make([]int, 100)
+	h.expect(422, "POST", "/api/v1/workflows/w/batch", map[string]any{"params": map[string]any{"positive": "x"}, "grid": map[string]any{"steps": tooMany}})
+	h.expect(422, "POST", "/api/v1/workflows/w/batch", map[string]any{"params": map[string]any{"positive": "x"}, "grid": map[string]any{"steps": []int{}}})
+	h.expect(422, "POST", "/api/v1/workflows/w/batch", map[string]any{"params": map[string]any{"steps": 5}, "grid": map[string]any{"steps": []int{10}}})
+	h.expect(422, "POST", "/api/v1/workflows/w/batch", map[string]any{"params": map[string]any{"positive": "x"}, "grid": map[string]any{"unknown": []int{1}}})
+	h.expect(404, "POST", "/api/v1/workflows/nope/batch", map[string]any{})
+}
+
+func TestRunAnnotationsAndFilters(t *testing.T) {
+	h := newHarness(t, "")
+	h.expect(201, "POST", "/api/v1/workflows", map[string]any{"slug": "w", "api": exampleWorkflow(t)})
+	run := h.startRun(map[string]any{"positive": "x"})
+	h.waitDone(run.ID)
+
+	var got store.Run
+	json.Unmarshal(h.expect(200, "PATCH", "/api/v1/runs/"+run.ID,
+		map[string]any{"tags": []string{"Portrait", "keep"}, "favorite": true, "note": "nice hands"}), &got)
+	if !got.Favorite || got.Note != "nice hands" || len(got.Tags) != 2 || got.Tags[0] != "portrait" {
+		t.Fatalf("annotations were not saved: %+v", got)
+	}
+	h.expect(422, "PATCH", "/api/v1/runs/"+run.ID, map[string]any{"tags": []string{"not valid"}})
+	h.expect(400, "PATCH", "/api/v1/runs/"+run.ID, map[string]any{"colour": "red"})
+
+	count := func(query string) int {
+		var runs []store.Run
+		json.Unmarshal(h.expect(200, "GET", "/api/v1/runs"+query, nil), &runs)
+		return len(runs)
+	}
+	if n := count("?tag=Portrait"); n != 1 {
+		t.Fatalf("tag filter (case-insensitive): %d", n)
+	}
+	if n := count("?favorite=true&status=succeeded&workflow=w"); n != 1 {
+		t.Fatalf("combined filters: %d", n)
+	}
+	if n := count("?tag=other"); n != 0 {
+		t.Fatalf("unknown tag should match nothing: %d", n)
+	}
+	if n := count("?since=2999-01-01T00:00:00Z"); n != 0 {
+		t.Fatalf("since in the future should match nothing: %d", n)
+	}
+	h.expect(400, "GET", "/api/v1/runs?status=bogus", nil)
+	h.expect(400, "GET", "/api/v1/runs?since=yesterday", nil)
+	h.expect(400, "GET", "/api/v1/runs?favorite=maybe", nil)
 }
