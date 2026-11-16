@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -262,7 +261,15 @@ func (s *Store) runPath(id string) string { return filepath.Join(s.dir, "runs", 
 // RunDir is where the outputs of a run are stored.
 func (s *Store) RunDir(id string) string { return filepath.Join(s.dir, "outputs", id) }
 
+// PutRun saves a run. It takes the store lock so it cannot interleave with
+// UpdateRun, DeleteRun or Prune.
 func (s *Store) PutRun(r Run) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.putRun(r)
+}
+
+func (s *Store) putRun(r Run) error {
 	if !runIDRe.MatchString(r.ID) {
 		return fmt.Errorf("%w: bad run id %q", ErrInvalid, r.ID)
 	}
@@ -284,29 +291,42 @@ func (s *Store) GetRun(id string) (Run, error) {
 	return r, json.Unmarshal(raw, &r)
 }
 
-// ListRuns returns the newest runs first, optionally filtered by workflow.
-func (s *Store) ListRuns(workflowSlug string, limit int) ([]Run, error) {
+// walkRuns calls fn for every run, newest first, until fn returns false. Run
+// ids start with their creation time, so the sorted directory listing is
+// already the order we want and nothing has to be sorted or loaded up front.
+func (s *Store) walkRuns(fn func(Run) bool) error {
 	entries, err := os.ReadDir(filepath.Join(s.dir, "runs"))
 	if err != nil {
-		return nil, err
+		return err
 	}
-	var out []Run
-	for _, e := range entries {
-		id, ok := strings.CutSuffix(e.Name(), ".json")
+	for i := len(entries) - 1; i >= 0; i-- {
+		id, ok := strings.CutSuffix(entries[i].Name(), ".json")
 		if !ok || !runIDRe.MatchString(id) {
 			continue
 		}
 		r, err := s.GetRun(id)
-		if err != nil {
-			return nil, err
+		if errors.Is(err, ErrNotFound) {
+			continue // deleted since the directory was read
 		}
+		if err != nil {
+			return err
+		}
+		if !fn(r) {
+			break
+		}
+	}
+	return nil
+}
+
+// ListRuns returns the newest runs first, optionally filtered by workflow.
+// With a limit it stops reading as soon as it has enough.
+func (s *Store) ListRuns(workflowSlug string, limit int) ([]Run, error) {
+	var out []Run
+	err := s.walkRuns(func(r Run) bool {
 		if workflowSlug == "" || r.Workflow == workflowSlug {
 			out = append(out, r)
 		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID > out[j].ID })
-	if limit > 0 && len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
+		return limit <= 0 || len(out) < limit
+	})
+	return out, err
 }

@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -79,5 +80,47 @@ func TestNormalizeTags(t *testing.T) {
 		if _, err := NormalizeTags(bad); err == nil {
 			t.Errorf("%v should be rejected", bad)
 		}
+	}
+}
+
+func TestListRunsStopsAtLimitAndUpdateRefusesRunsInFlight(t *testing.T) {
+	st, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := []string{"20260101-000001-aaaaaa", "20260101-000002-bbbbbb", "20260101-000003-cccccc", "20260101-000004-dddddd"}
+	for i, id := range ids {
+		wf, status := "a", StatusSucceeded
+		if i%2 == 1 {
+			wf = "b"
+		}
+		if i == 3 {
+			status = StatusRunning
+		}
+		if err := st.PutRun(Run{ID: id, Workflow: wf, Status: status, CreatedAt: time.Now().UTC()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	top, err := st.ListRuns("", 2)
+	if err != nil || len(top) != 2 || top[0].ID != ids[3] || top[1].ID != ids[2] {
+		t.Fatalf("newest first, limited: %+v %v", top, err)
+	}
+	onlyA, err := st.ListRuns("a", 1)
+	if err != nil || len(onlyA) != 1 || onlyA[0].ID != ids[2] {
+		t.Fatalf("workflow filter with limit: %+v %v", onlyA, err)
+	}
+	filtered, err := st.FilterRuns(RunFilter{Status: StatusSucceeded, Limit: 2})
+	if err != nil || len(filtered) != 2 || filtered[0].ID != ids[2] {
+		t.Fatalf("FilterRuns: %+v %v", filtered, err)
+	}
+
+	if _, err := st.UpdateRun(ids[3], func(r *Run) error { r.Favorite = true; return nil }); !errors.Is(err, ErrExists) {
+		t.Fatalf("a run in flight must be refused, got %v", err)
+	}
+	if got, _ := st.GetRun(ids[3]); got.Favorite {
+		t.Fatal("the refused update must not be saved")
+	}
+	if _, err := st.UpdateRun(ids[0], func(r *Run) error { r.Favorite = true; return nil }); err != nil {
+		t.Fatal(err)
 	}
 }

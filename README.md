@@ -123,7 +123,12 @@ ou WSL, ou reprends les commandes `curl` qu'il contient.
     }'
 
 La réponse (202) contient l'identifiant du run. Un `seed` absent ou égal à `-1`
-est tiré au hasard, et la valeur utilisée est enregistrée dans le run.
+est tiré au hasard, et la valeur utilisée est enregistrée dans le run. Le `-1` est
+une convention de ComfyVault, pas de ComfyUI (qui n'accepte que des entiers positifs) :
+le service le remplace par une vraie valeur avant d'envoyer le graphe. Un binding de
+type `seed` peut avoir un `default` fixe, utilisé tant qu'aucune seed n'est donnée.
+Sur un graphe à plusieurs échantillonneurs (hires fix), la même seed pilote tous
+les `KSampler`, ce qui garde les rejeux exacts.
 
     curl -s localhost:8080/api/v1/runs/<id>
     curl -s -o image.png localhost:8080/api/v1/runs/<id>/outputs/<nom-du-fichier>
@@ -134,6 +139,26 @@ telle quelle dans la réponse du `POST .../run`, avec le détail par nœud.
 
 Avant de lancer, `GET /api/v1/workflows/<slug>/check` compare les nœuds du
 workflow à ceux installés dans ton ComfyUI et liste ceux qui manquent.
+
+### Interface web
+
+Une fois le service lancé, ouvre `http://127.0.0.1:8080/` : l'interface est
+embarquée dans le binaire (aucune dépendance, aucune police distante).
+
+- **Workflows** : importer un export « API Format », modifier le nom et la description,
+  voir les versions et les paramètres, vérifier les nœuds installés, lancer (avec un
+  formulaire généré depuis les paramètres, un preset pour `positive`/`negative` et un
+  nombre d'images), supprimer.
+- **Blocs** et **presets** : créer, modifier, supprimer, chercher ; un preset se compose
+  en ordonnant ses blocs, avec aperçu du prompt rendu.
+- **Runs** : planche-contact des images, filtres par statut et favoris, détail avec
+  annulation, rejeu, nouvelle seed, étiquettes, note, favori et suppression.
+- **Bibliothèque** : statistiques et espace disque, export/import JSON, nettoyage des
+  anciens runs.
+
+Si `COMFYVAULT_API_KEY` est défini, la page se charge sans clé (elle ne contient aucune
+donnée) puis la demande avant le premier appel à l'API ; la clé reste dans la session
+du navigateur.
 
 ### 5. Annuler, rejouer, lancer en série
 
@@ -224,6 +249,13 @@ complète des variables manquantes. Un bloc utilisé par un preset ne peut pas
 | `GET /api/v1/runs/{id}` | statut, paramètres résolus, erreur éventuelle |
 | `PATCH /api/v1/runs/{id}` | `tags`, `favorite`, `note` (run terminé uniquement) |
 | `POST /api/v1/runs/{id}/cancel` | annule un run en attente ou en cours |
+| `DELETE /api/v1/runs/{id}` | supprime un run terminé et ses images |
+| `PATCH /api/v1/workflows/{slug}` | renomme / change la description |
+| `DELETE /api/v1/workflows/{slug}` | supprime le workflow (refusé s'il reste des runs) |
+| `GET /api/v1/library/stats` | compteurs, runs par statut, espace disque des images |
+| `GET /api/v1/library/export` | workflows (toutes versions), blocs, presets en un JSON |
+| `POST /api/v1/library/import` | fusionne un export ; `?overwrite=true` remplace blocs et presets |
+| `POST /api/v1/library/prune` | `older_than_days`, `include_favorites`, `dry_run` |
 | `POST /api/v1/runs/{id}/replay` | relance avec les mêmes paramètres ; `params`, `new_seed` optionnels |
 | `GET /api/v1/runs/{id}/outputs/{name}` | télécharge un fichier produit |
 
@@ -283,3 +315,41 @@ sont ignorés.
 
 Les tests d'intégration de `internal/api` simulent ComfyUI avec un serveur HTTP
 local ; ils ne demandent aucun ComfyUI réel.
+
+## Aide en ligne de commande
+
+```
+$ comfyvault help
+comfyvault - store, template and serve ComfyUI workflows as an API
+
+Usage:
+  comfyvault [serve]                       start the HTTP server
+  comfyvault import [flags] <workflow.json>
+      -slug string       identifier of the workflow (required)
+      -name string       display name
+      -desc string       description
+      -bindings string   JSON file with bindings; suggested automatically when omitted
+  comfyvault suggest <workflow.json>       print suggested bindings as JSON
+  comfyvault prune [flags]                 delete old finished runs and their images
+      -older-than string  minimum age, e.g. 12h, 30d, 2w (required)
+      -dry-run            only report what would be deleted
+      -include-favorites  also delete runs marked as favorite
+      -force              prune even though a service answers on COMFYVAULT_LISTEN
+  comfyvault version
+```
+
+`prune` refuse de tourner pendant que le service répond : il faut l'arrêter, passer par
+`POST /api/v1/library/prune` (ou l'onglet Bibliothèque), ou ajouter `-force`. Le service
+re-vérifie chaque run sous verrou juste avant de le supprimer.
+
+## Fiabilité
+
+- `POST .../cancel` borne le travail réel (pas seulement l'attente) à 15 s ; au-delà,
+  l'API répond 504 et rien n'est enregistré comme annulé.
+- Une requête dont le client se déconnecte pendant l'envoi à ComfyUI ne laisse pas de
+  job orphelin : l'envoi est détaché de la requête et, si l'enregistrement du run
+  échoue, le prompt est retiré de la file.
+- Si ComfyUI ne répond plus, l'interrogation ralentit (jusqu'à 15 s) et un run n'est
+  déclaré perdu qu'après 90 s sans contact.
+- Un fichier de sortie est limité à 1 Gio.
+- La CI (`.github/workflows/ci.yml`) lance gofmt, `go vet` et `go test -race`.

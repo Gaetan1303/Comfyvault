@@ -454,3 +454,130 @@ func TestRunAnnotationsAndFilters(t *testing.T) {
 	h.expect(400, "GET", "/api/v1/runs?since=yesterday", nil)
 	h.expect(400, "GET", "/api/v1/runs?favorite=maybe", nil)
 }
+
+func TestWebUIIsServedWithoutKey(t *testing.T) {
+	h := newHarness(t, "s3cret")
+	code, body := h.call("GET", "/", nil, "")
+	if code != 200 || !strings.Contains(string(body), "ComfyVault") || !strings.Contains(string(body), "<script>") {
+		t.Fatalf("the page must load without the key: %d %.80s", code, body)
+	}
+	if code, _ := h.call("GET", "/api/v1/blocks", nil, ""); code != 401 {
+		t.Fatalf("the API must stay protected: %d", code)
+	}
+	if code, _ := h.call("GET", "/nope", nil, "s3cret"); code != 404 {
+		t.Fatalf("only / serves the page: %d", code)
+	}
+}
+
+func TestWorkflowRenameAndLibraryTransfer(t *testing.T) {
+	a := newHarness(t, "")
+	a.expect(201, "POST", "/api/v1/blocks", map[string]any{"id": "quality", "text": "masterpiece"})
+	a.expect(201, "POST", "/api/v1/presets", map[string]any{"id": "p", "blocks": []string{"quality"}})
+	a.expect(201, "POST", "/api/v1/workflows", map[string]any{"slug": "w", "name": "W", "api": exampleWorkflow(t)})
+
+	var meta struct{ Name, Description string }
+	json.Unmarshal(a.expect(200, "PATCH", "/api/v1/workflows/w", map[string]any{"name": "Renamed", "description": "d"}), &meta)
+	if meta.Name != "Renamed" || meta.Description != "d" {
+		t.Fatalf("rename: %+v", meta)
+	}
+	a.expect(422, "PATCH", "/api/v1/workflows/w", map[string]any{"name": "  "})
+	a.expect(404, "PATCH", "/api/v1/workflows/nope", map[string]any{"name": "x"})
+	a.expect(400, "PATCH", "/api/v1/workflows/w", map[string]any{"title": "typo"})
+
+	bundle := a.expect(200, "GET", "/api/v1/library/export", nil)
+
+	b := newHarness(t, "")
+	var rep store.ImportReport
+	json.Unmarshal(b.expect(200, "POST", "/api/v1/library/import", json.RawMessage(bundle)), &rep)
+	if rep.WorkflowVersions != 1 || rep.Blocks != 1 || rep.Presets != 1 || len(rep.Errors) != 0 {
+		t.Fatalf("first import: %+v", rep)
+	}
+	var again store.ImportReport
+	json.Unmarshal(b.expect(200, "POST", "/api/v1/library/import", json.RawMessage(bundle)), &again)
+	if again.WorkflowVersions != 0 || again.Blocks != 0 || again.Presets != 0 || len(again.Skipped) != 2 {
+		t.Fatalf("second import should change nothing: %+v", again)
+	}
+	var over store.ImportReport
+	json.Unmarshal(b.expect(200, "POST", "/api/v1/library/import?overwrite=true", json.RawMessage(bundle)), &over)
+	if over.Blocks != 1 || over.Presets != 1 {
+		t.Fatalf("overwrite import: %+v", over)
+	}
+	var got struct{ Name string }
+	json.Unmarshal(b.expect(200, "GET", "/api/v1/workflows/w", nil), &got)
+	if got.Name != "Renamed" {
+		t.Fatalf("imported workflow name: %q", got.Name)
+	}
+
+	b.expect(422, "POST", "/api/v1/library/import", map[string]any{"format": "something-else"})
+	b.expect(400, "POST", "/api/v1/library/import", json.RawMessage(`[1,2]`))
+	broken := map[string]any{"format": store.BundleFormat, "presets": []map[string]any{{"id": "x", "blocks": []string{"ghost"}}}}
+	var bad store.ImportReport
+	json.Unmarshal(b.expect(200, "POST", "/api/v1/library/import", broken), &bad)
+	if len(bad.Errors) != 1 || bad.Presets != 0 {
+		t.Fatalf("a preset with an unknown block must be reported: %+v", bad)
+	}
+}
+
+func TestDeleteAndStats(t *testing.T) {
+	h := newHarness(t, "")
+	h.fake.mu.Lock()
+	h.fake.hold = true
+	h.fake.mu.Unlock()
+	h.expect(201, "POST", "/api/v1/workflows", map[string]any{"slug": "w", "api": exampleWorkflow(t)})
+	run := h.startRun(map[string]any{"positive": "x"})
+
+	h.expect(409, "DELETE", "/api/v1/runs/"+run.ID, nil) // still in flight
+	h.expect(409, "DELETE", "/api/v1/workflows/w", nil)  // runs still refer to it
+	h.expect(200, "POST", "/api/v1/runs/"+run.ID+"/cancel", nil)
+
+	var st store.Stats
+	json.Unmarshal(h.expect(200, "GET", "/api/v1/library/stats", nil), &st)
+	if st.Workflows != 1 || st.Versions != 1 || st.Runs != 1 || st.RunsByStatus[store.StatusCancelled] != 1 {
+		t.Fatalf("stats: %+v", st)
+	}
+
+	var pr struct {
+		Runs int  `json:"runs"`
+		Dry  bool `json:"dry_run"`
+	}
+	json.Unmarshal(h.expect(200, "POST", "/api/v1/library/prune", map[string]any{"older_than_days": 1, "dry_run": true}), &pr)
+	if pr.Runs != 0 || !pr.Dry {
+		t.Fatalf("a fresh run is not old enough to be pruned: %+v", pr)
+	}
+	h.expect(422, "POST", "/api/v1/library/prune", map[string]any{"older_than_days": 0})
+
+	h.expect(204, "DELETE", "/api/v1/runs/"+run.ID, nil)
+	h.expect(404, "GET", "/api/v1/runs/"+run.ID, nil)
+	h.expect(204, "DELETE", "/api/v1/workflows/w", nil)
+	h.expect(404, "DELETE", "/api/v1/workflows/w", nil)
+}
+
+func TestStrictInputs(t *testing.T) {
+	h := newHarness(t, "")
+	h.expect(201, "POST", "/api/v1/workflows", map[string]any{"slug": "w", "api": exampleWorkflow(t)})
+
+	for _, q := range []string{"abc", "-3", "0", "1.5"} {
+		h.expect(400, "GET", "/api/v1/workflows/w?version="+q, nil)
+		h.expect(400, "GET", "/api/v1/workflows/w/check?version="+q, nil)
+	}
+	h.expect(404, "GET", "/api/v1/workflows/w?version=9", nil)
+	h.expect(200, "GET", "/api/v1/workflows/w?version=1", nil)
+
+	post := func(body string) int {
+		resp, err := http.Post(h.srv.URL+"/api/v1/blocks", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if c := post(`{"id":"a","text":"x"}{"id":"b","text":"y"}`); c != 400 {
+		t.Fatalf("a second JSON value must be rejected, got %d", c)
+	}
+	if c := post(`{"id":"a","text":"x"} garbage`); c != 400 {
+		t.Fatalf("trailing garbage must be rejected, got %d", c)
+	}
+	if c := post("{\"id\":\"a\",\"text\":\"x\"}\n  \n"); c != 201 {
+		t.Fatalf("trailing whitespace is fine, got %d", c)
+	}
+}

@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ComfyVault</title>
+<style>
+:root{--bg:#e6ebe8;--paper:#f6f8f7;--ink:#16201d;--muted:#5a6a65;--line:#c7d1cc;--acc:#1d5c50;--on:#fff;--bad:#a63d2b;--strip:#0e1311}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1513;--paper:#172019;--ink:#e3ebe7;--muted:#90a29b;--line:#2a3832;--acc:#5fbfa8;--on:#08140f;--bad:#e0745f;--strip:#070a09}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+h1,h2,h3{font-family:"Iowan Old Style","Palatino Linotype",Palatino,Georgia,serif;font-weight:600;margin:0}
+button,input,select,textarea{font:inherit;color:inherit}
+button{background:var(--paper);border:1px solid var(--line);border-radius:6px;padding:.35em .8em;cursor:pointer}
+button:hover{border-color:var(--acc)}
+button.primary{background:var(--acc);color:var(--on);border-color:var(--acc)}
+button.danger{color:var(--bad)}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+input,select,textarea{background:var(--paper);border:1px solid var(--line);border-radius:6px;padding:.4em .6em;width:100%}
+textarea{resize:vertical}
+.app{display:grid;grid-template-columns:220px 1fr;min-height:100vh}
+.rail{background:var(--paper);border-right:1px solid var(--line);padding:1.2rem .8rem;display:flex;flex-direction:column;gap:.2rem}
+.brand{font-size:1.45rem;padding:0 .5rem 1rem}
+.rail button{display:flex;justify-content:space-between;border:0;background:none;border-radius:6px;padding:.5em .6em;text-align:left}
+.rail button span{color:var(--muted);font-variant-numeric:tabular-nums}
+.rail button[aria-current=true]{background:var(--acc);color:var(--on)}
+.rail button[aria-current=true] span{color:inherit}
+.health{margin:auto .5rem 0;color:var(--muted);font-size:.85rem}
+.health::before{content:"";display:inline-block;width:.55em;height:.55em;border-radius:50%;background:var(--muted);margin-right:.5em}
+.health.up::before{background:var(--acc)}.health.down::before{background:var(--bad)}
+main{padding:1.5rem 2rem 4rem;min-width:0}
+.top{display:flex;flex-wrap:wrap;gap:1rem;align-items:center;justify-content:space-between;margin-bottom:1.2rem}
+.top h2{font-size:1.9rem}
+.tools{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center}.tools input[type=search]{width:14rem}.tools select{width:auto}
+.chk{display:flex;gap:.4rem;align-items:center;width:auto}.chk input{width:auto}
+.row{display:flex;gap:1rem;align-items:flex-start;padding:.9rem 0;border-top:1px solid var(--line)}
+.row:last-child{border-bottom:1px solid var(--line)}
+.grow{flex:1;min-width:0}.row h3{font-size:1.1rem}
+.meta{display:flex;flex-wrap:wrap;gap:.2rem 1rem;color:var(--muted);font-size:.88rem;margin:.1rem 0}
+.snip{margin:.2rem 0;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chips{display:flex;flex-wrap:wrap;gap:.3rem;margin:.3rem 0 0}
+.chip{border:1px solid var(--line);border-radius:99px;padding:0 .6em;font-size:.82rem;background:var(--paper)}
+.acts{display:flex;gap:.4rem;flex-wrap:wrap;justify-content:flex-end}
+.empty{padding:3rem 0;color:var(--muted);max-width:42ch}
+.sheet{background:var(--strip);padding:1rem;border-radius:4px;display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:.8rem}
+.frame{padding:0;border:1px solid #3a4742;border-radius:2px;background:#1a2320;color:#dfe8e4;text-align:left;overflow:hidden;display:block}
+.ph{display:block;aspect-ratio:1;background:#0b100e}.ph img{width:100%;height:100%;object-fit:cover;display:block}
+.cap{display:block;padding:.35rem .5rem;font-size:.8rem;line-height:1.35}
+.cap b{font-weight:600}.fav{float:right}
+.st::before{content:"";display:inline-block;width:.6em;height:.6em;border-radius:50%;margin-right:.35em;background:#8a9a94}
+.st.succeeded::before{background:#5fbfa8}.st.failed::before{background:#e0745f}.st.cancelled::before{background:#c9a24b}.st.running::before{background:#6ea8e8}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);margin-bottom:2rem}
+.stats div{background:var(--paper);padding:.8rem 1rem}.stats dt{color:var(--muted);font-size:.85rem}.stats dd{margin:0;font:600 1.6rem Georgia,serif}.stats small{display:block;color:var(--muted);font-size:.8rem}
+.panel{border-top:1px solid var(--line);padding:1rem 0;display:grid;gap:.6rem;max-width:34rem}.panel h3{font-size:1.15rem}.panel p{margin:0;color:var(--muted)}
+dialog{border:1px solid var(--line);border-radius:10px;background:var(--paper);color:var(--ink);padding:0;width:min(40rem,94vw);max-height:90vh}
+dialog::backdrop{background:rgba(5,10,8,.55)}
+dialog[open]{display:flex;flex-direction:column}
+.dh{display:flex;justify-content:space-between;align-items:center;padding:1rem 1.2rem;border-bottom:1px solid var(--line)}.dh h2{font-size:1.3rem}.dh .x{border:0;background:none;font-size:1.4rem;line-height:1}
+.db{padding:1rem 1.2rem;overflow:auto;display:grid;gap:.8rem}.df{padding:.8rem 1.2rem;border-top:1px solid var(--line);display:flex;gap:.5rem;justify-content:flex-end;flex-wrap:wrap}
+.db label{display:grid;gap:.25rem;font-weight:500}.db label.chk{display:flex;font-weight:400}.db small{color:var(--muted);font-weight:400}
+pre{background:var(--bg);border-radius:6px;padding:.6rem;overflow:auto;font-size:.82rem;margin:.4rem 0 0;white-space:pre-wrap;word-break:break-word}
+.shots{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.5rem}.shots img{width:100%;border-radius:4px;display:block}
+.err{color:var(--bad);margin:0}
+table{border-collapse:collapse;width:100%;font-size:.88rem}td,th{border-top:1px solid var(--line);padding:.3rem .4rem;text-align:left;font-weight:400}th{color:var(--muted)}
+.pbl{display:flex;gap:.3rem;align-items:center;padding:.2rem 0;border-top:1px solid var(--line)}.pbl span{flex:1}.pbl button{padding:0 .5em}
+#toast{position:fixed;right:1rem;bottom:1rem;max-width:28rem;background:var(--ink);color:var(--bg);padding:.6rem .9rem;border-radius:8px;display:none;z-index:9}
+#toast.bad{background:var(--bad);color:#fff}
+@media (max-width:760px){.app{grid-template-columns:1fr}.rail{flex-direction:row;overflow-x:auto;border-right:0;border-bottom:1px solid var(--line);padding:.6rem}.brand,.health{display:none}.rail button{white-space:nowrap;gap:.5rem}main{padding:1rem}.row{flex-wrap:wrap}.acts{justify-content:flex-start}}
+</style>
+</head>
+<body>
+<div class="app"><nav class="rail" id="rail"></nav><main id="main"></main></div>
+<dialog id="dlg"></dialog>
+<div id="toast" role="status"></div>
+<script>
+const $=(s,e=document)=>e.querySelector(s),$$=(s,e=document)=>[...e.querySelectorAll(s)];
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const TABS=[['workflows','Workflows'],['blocks','Blocs'],['presets','Presets'],['runs','Runs'],['library','Bibliothèque']];
+const ST={queued:'en file',running:'en cours',succeeded:'terminé',failed:'échec',cancelled:'annulé'};
+const DONE=['succeeded','failed','cancelled'];
+const S={tab:'workflows',wf:[],blocks:[],presets:[],runs:[],stats:{},q:'',rs:'',fav:false,health:''};
+let key=sessionStorage.getItem('cv-key')||'',PB=[];
+
+async function raw(method,path,body){
+  const h={};if(key)h.Authorization='Bearer '+key;
+  if(body!==undefined)h['Content-Type']='application/json';
+  const r=await fetch('/api/v1'+path,{method,headers:h,body:body===undefined?undefined:typeof body==='string'?body:JSON.stringify(body)});
+  if(r.status===401){const k=prompt('Clé API de ComfyVault');if(k){key=k;sessionStorage.setItem('cv-key',k);return raw(method,path,body)}}
+  return r;
+}
+async function api(method,path,body){
+  const r=await raw(method,path,body);if(r.status===204)return null;
+  const t=await r.text();let j;try{j=JSON.parse(t)}catch{j=t}
+  if(!r.ok)throw new Error((j&&j.error||t||r.statusText)+(j&&j.comfyui?' : '+JSON.stringify(j.comfyui).slice(0,300):''));
+  return j;
+}
+const blobs={};
+async function img(el,path){
+  if(!blobs[path]){const r=await raw('GET',path);if(!r.ok)return;blobs[path]=URL.createObjectURL(await r.blob())}
+  el.src=blobs[path];
+}
+let tt;function toast(m,bad){const t=$('#toast');t.textContent=m;t.className=bad?'bad':'';t.style.display='block';clearTimeout(tt);tt=setTimeout(()=>t.style.display='none',bad?7000:3500)}
+const mo=b=>(b/1048576).toFixed(1)+' Mo';
+const v=id=>$('#f-'+id).value.trim();
+const tags=s=>s.split(',').map(x=>x.trim()).filter(Boolean);
+const vars=s=>Object.fromEntries(s.split(',').map(p=>p.split('=').map(x=>x.trim())).filter(p=>p[0]).map(p=>[p[0],p[1]??'']));
+const has=(q,...xs)=>!q||xs.join(' ').toLowerCase().includes(q.toLowerCase());
+const chips=a=>(a&&a.length)?`<p class="chips">${a.map(x=>`<span class="chip">${esc(x)}</span>`).join('')}</p>`:'';
+
+function dialog(title,body,foot){
+  const d=$('#dlg');
+  d.innerHTML=`<form method="dialog" class="dh"><h2>${title}</h2><button class="x" aria-label="Fermer">×</button></form><div class="db">${body}</div><div class="df">${foot||''}</div>`;
+  $$('img[data-src]',d).forEach(i=>img(i,i.dataset.src));
+  if(!d.open)d.showModal();
+}
+const cancelBtn='<button data-a="close">Fermer</button>';
+
+async function load(){
+  [S.wf,S.blocks,S.presets,S.runs,S.stats]=await Promise.all([api('GET','/workflows'),api('GET','/blocks'),api('GET','/presets'),api('GET','/runs?limit=200'),api('GET','/library/stats')]);
+  render();
+}
+function rail(){
+  const n={workflows:S.wf.length,blocks:S.blocks.length,presets:S.presets.length,runs:S.runs.length};
+  $('#rail').innerHTML='<h1 class="brand">ComfyVault</h1>'+TABS.map(([k,l])=>`<button data-a="tab" data-id="${k}" aria-current="${S.tab===k}">${l}<span>${n[k]??''}</span></button>`).join('')+`<p class="health ${S.health}">${S.health==='up'?'ComfyUI joignable':S.health==='down'?'ComfyUI injoignable':''}</p>`;
+}
+function render(){
+  rail();
+  const q=`<input type="search" id="q" placeholder="Rechercher" aria-label="Rechercher" value="${esc(S.q)}">`;
+  const tools={
+    workflows:q+'<button class="primary" data-a="wf-new">Importer un workflow</button>',
+    blocks:q+'<button class="primary" data-a="block-edit">Nouveau bloc</button>',
+    presets:q+'<button class="primary" data-a="preset-edit">Nouveau preset</button>',
+    runs:q+`<select id="rs" aria-label="Statut"><option value="">Tous les statuts</option>${Object.entries(ST).map(([k,l])=>`<option value="${k}" ${S.rs===k?'selected':''}>${l}</option>`).join('')}</select><label class="chk"><input type="checkbox" id="rfav" ${S.fav?'checked':''}>Favoris</label>`,
+    library:''}[S.tab];
+  $('#main').innerHTML=`<header class="top"><h2>${Object.fromEntries(TABS)[S.tab]}</h2><div class="tools">${tools}</div></header><div id="list"></div>`;
+  list();
+}
+function list(){
+  const L=$('#list');
+  L.innerHTML={workflows:lWf,blocks:lBlocks,presets:lPresets,runs:lRuns,library:lLib}[S.tab]();
+  $$('img[data-src]',L).forEach(i=>img(i,i.dataset.src));
+}
+const empty=t=>`<p class="empty">${t}</p>`;
+function lWf(){
+  const a=S.wf.filter(w=>has(S.q,w.slug,w.name,w.description,w.parameters.join(' ')));
+  return a.length?a.map(w=>`<article class="row"><div class="grow"><h3>${esc(w.name)}</h3><p class="meta"><span>${esc(w.slug)}</span><span>version ${w.latest_version}</span></p>${w.description?`<p class="snip">${esc(w.description)}</p>`:''}${chips(w.parameters)}</div><div class="acts"><button class="primary" data-a="wf-run" data-id="${w.slug}">Lancer</button><button data-a="wf-open" data-id="${w.slug}">Détails</button><button class="danger" data-a="wf-del" data-id="${w.slug}">Supprimer</button></div></article>`).join(''):empty(S.wf.length?'Aucun workflow ne correspond.':'Aucun workflow. Dans ComfyUI, exporte un graphe avec « Save (API Format) », puis importe-le ici.');
+}
+function lBlocks(){
+  const a=S.blocks.filter(b=>has(S.q,b.id,b.name,b.kind,b.text,(b.tags||[]).join(' ')));
+  return a.length?a.map(b=>`<article class="row"><div class="grow"><h3>${esc(b.name||b.id)}</h3><p class="meta"><span>${esc(b.id)}</span>${b.kind?`<span>${esc(b.kind)}</span>`:''}</p><p class="snip">${esc(b.text)}</p>${chips(b.tags)}</div><div class="acts"><button data-a="block-edit" data-id="${b.id}">Modifier</button><button class="danger" data-a="block-del" data-id="${b.id}">Supprimer</button></div></article>`).join(''):empty(S.blocks.length?'Aucun bloc ne correspond.':'Aucun bloc. Un bloc est un fragment de prompt réutilisable : en-tête de qualité, description de personnage, déclencheur de LoRA.');
+}
+function lPresets(){
+  const a=S.presets.filter(p=>has(S.q,p.id,p.name,p.blocks.join(' ')));
+  return a.length?a.map(p=>`<article class="row"><div class="grow"><h3>${esc(p.name||p.id)}</h3><p class="meta"><span>${esc(p.id)}</span><span>${p.blocks.length} blocs</span></p>${chips(p.blocks)}</div><div class="acts"><button data-a="preset-edit" data-id="${p.id}">Modifier</button><button class="danger" data-a="preset-del" data-id="${p.id}">Supprimer</button></div></article>`).join(''):empty(S.presets.length?'Aucun preset ne correspond.':'Aucun preset. Un preset assemble des blocs dans un ordre précis pour composer un prompt.');
+}
+function lRuns(){
+  const a=S.runs.filter(r=>(!S.rs||r.status===S.rs)&&(!S.fav||r.favorite)&&has(S.q,r.id,r.workflow,r.note,(r.tags||[]).join(' ')));
+  if(!a.length)return empty(S.runs.length?'Aucun run ne correspond.':'Aucun run. Lance un workflow pour remplir la planche-contact.');
+  return `<div class="sheet">${a.map(r=>{const o=(r.outputs||[])[0];return `<button class="frame" data-a="run-open" data-id="${r.id}"><span class="ph">${o?`<img data-src="/runs/${r.id}/outputs/${encodeURIComponent(o.name)}" alt="">`:''}</span><span class="cap"><b class="st ${r.status}">${ST[r.status]}</b>${r.favorite?'<span class="fav" title="Favori">★</span>':''}<br>${esc(r.workflow)} v${r.version}</span></button>`}).join('')}</div>`;
+}
+function lLib(){
+  const s=S.stats,by=s.runs_by_status||{};
+  const d=(t,n,sub)=>`<div><dt>${t}</dt><dd>${n}</dd>${sub?`<small>${sub}</small>`:''}</div>`;
+  return `<dl class="stats">${d('Workflows',s.workflows,s.versions+' versions')}${d('Blocs',s.blocks)}${d('Presets',s.presets)}${d('Runs',s.runs,Object.entries(by).map(([k,n])=>n+' '+ST[k]).join(', '))}${d('Favoris',s.favorites)}${d('Images',mo(s.output_bytes||0))}</dl>
+  <section class="panel"><h3>Exporter</h3><p>Workflows (toutes les versions), blocs et presets dans un seul fichier JSON. Les runs et les images n'en font pas partie.</p><div><button data-a="lib-export">Télécharger l'export</button></div></section>
+  <section class="panel"><h3>Importer</h3><input type="file" id="imp-file" accept=".json,application/json" aria-label="Fichier d'export"><label class="chk"><input type="checkbox" id="imp-ow">Remplacer les blocs et presets existants</label><div><button class="primary" data-a="lib-import">Importer</button></div><pre id="imp-out" hidden></pre></section>
+  <section class="panel"><h3>Faire de la place</h3><p>Supprime les runs terminés plus anciens que le délai, avec leurs images.</p><label>Plus anciens que (jours)<input type="number" id="pr-d" min="1" value="30"></label><label class="chk"><input type="checkbox" id="pr-f">Inclure les favoris</label><div class="acts" style="justify-content:flex-start"><button data-a="prune" data-id="dry">Simuler</button><button class="danger" data-a="prune" data-id="real">Supprimer</button></div></section>`;
+}
+
+/* workflows */
+function wfNew(){
+  dialog('Importer un workflow',`<label>Identifiant<input id="f-slug" placeholder="txt2img"><small>Lettres minuscules, chiffres, - et _.</small></label><label>Nom<input id="f-name"></label><label>Description<input id="f-desc"></label><label>Fichier JSON (API Format)<input type="file" id="f-file" accept=".json,application/json"></label><label>ou colle le JSON<textarea id="f-json" rows="5"></textarea></label>`,cancelBtn+'<button class="primary" data-a="wf-save">Importer</button>');
+  $('#f-file').onchange=async e=>{const f=e.target.files[0];if(f){$('#f-json').value=await f.text();if(!v('slug'))$('#f-slug').value=f.name.replace(/\.json$/i,'').toLowerCase().replace(/[^a-z0-9_-]+/g,'-').replace(/^-+/,'')}};
+}
+async function wfSave(){
+  let g;try{g=JSON.parse($('#f-json').value)}catch{return toast('Le JSON du workflow est invalide.',true)}
+  const r=await api('POST','/workflows',{slug:v('slug'),name:v('name'),description:v('desc'),api:g});
+  toast(r.created?`Version ${r.version} enregistrée`:'Contenu identique : aucune nouvelle version');$('#dlg').close();await load();
+}
+async function wfOpen(slug){
+  const w=await api('GET','/workflows/'+slug);
+  dialog(esc(w.name),`<label>Nom<input id="f-name" value="${esc(w.name)}"></label><label>Description<textarea id="f-desc" rows="2">${esc(w.description)}</textarea></label>
+  <p class="meta">${w.versions.map(x=>`<span>v${x.version} · ${new Date(x.created_at).toLocaleDateString('fr-FR')}</span>`).join('')}</p>
+  <table><tr><th>Paramètre</th><th>Type</th><th>Entrée</th><th>Défaut</th></tr>${w.bindings.map(b=>`<tr><td>${esc(b.name)}${b.required?' *':''}</td><td>${b.type}</td><td>${esc(b.node_id)}.${esc(b.input)}</td><td>${esc(b.default??'')}</td></tr>`).join('')}</table>`,
+  `<button data-a="wf-check" data-id="${slug}">Vérifier les nœuds</button>${cancelBtn}<button class="primary" data-a="wf-meta" data-id="${slug}">Enregistrer</button>`);
+}
+async function wfRun(slug){
+  const w=await api('GET','/workflows/'+slug),seen={},opts=S.presets.map(p=>`<option value="${p.id}">${esc(p.name||p.id)}</option>`).join('');
+  const f=w.bindings.filter(b=>!seen[b.name]&&(seen[b.name]=1)).map(b=>{
+    const lab=esc(b.name)+(b.required?' (obligatoire)':'');
+    if(b.name==='positive'||b.name==='negative')return `<label>${lab}<textarea id="p-${b.name}" rows="3"></textarea><select id="s-${b.name}"><option value="">Texte saisi ci-dessus</option>${opts}</select></label>`;
+    if(b.type==='bool')return `<label>${lab}<select id="p-${b.name}"><option value="">Valeur par défaut</option><option>true</option><option>false</option></select></label>`;
+    const num=b.type!=='string';
+    return `<label>${lab}<input id="p-${b.name}" ${num?'type="number" step="any"':''} placeholder="${esc(b.default??(b.type==='seed'?'aléatoire':''))}"></label>`;
+  }).join('');
+  dialog('Lancer '+esc(w.name),`${f}<label>Variables des presets<input id="r-vars" placeholder="hair=silver, outfit=kimono"></label><label>Nombre d'images<input id="r-count" type="number" min="1" max="64" value="1"></label>`,cancelBtn+`<button class="primary" data-a="wf-go" data-id="${slug}" data-ver="${w.version}" data-names="${Object.keys(seen).join(',')}" data-types="${w.bindings.filter((b,i,a)=>a.findIndex(x=>x.name===b.name)===i).map(b=>b.type).join(',')}">Lancer</button>`);
+}
+async function wfGo(el){
+  const names=el.dataset.names.split(','),types=el.dataset.types.split(','),params={},body={version:+el.dataset.ver},vs=vars($('#r-vars').value);
+  names.forEach((n,i)=>{
+    const e=$('#p-'+n),val=e.value.trim(),sel=$('#s-'+n);
+    if(sel&&sel.value){body[n]={preset:sel.value,vars:vs};return}
+    if(val==='')return;
+    const t=types[i];params[n]=t==='int'||t==='seed'?parseInt(val,10):t==='float'?parseFloat(val):t==='bool'?val==='true':val;
+  });
+  body.params=params;const c=+$('#r-count').value||1;if(c>1)body.count=c;
+  await api('POST','/workflows/'+el.dataset.id+(c>1?'/batch':'/run'),body);
+  $('#dlg').close();toast(c>1?c+' runs lancés':'Run lancé');S.tab='runs';await load();
+}
+
+/* blocks and presets */
+function blockEdit(id){
+  const e=!!id,b=e?S.blocks.find(x=>x.id===id):{};
+  dialog(e?'Modifier le bloc':'Nouveau bloc',`<label>Identifiant<input id="f-id" value="${esc(b.id)}" ${e?'readonly':''} placeholder="quality-header"></label><label>Nom<input id="f-name" value="${esc(b.name)}"></label><label>Type<input id="f-kind" value="${esc(b.kind)}" placeholder="quality, character, lora"></label><label>Étiquettes<input id="f-tags" value="${esc((b.tags||[]).join(', '))}" placeholder="séparées par des virgules"></label><label>Texte<textarea id="f-text" rows="6">${esc(b.text)}</textarea><small>Variables : {{nom}}</small></label>`,cancelBtn+`<button class="primary" data-a="block-save" data-id="${e?id:''}">Enregistrer</button>`);
+}
+async function blockSave(old){
+  const body={id:old||v('id'),name:v('name'),kind:v('kind'),text:$('#f-text').value.trim(),tags:tags(v('tags'))};
+  await api(old?'PUT':'POST',old?'/blocks/'+old:'/blocks',body);$('#dlg').close();toast('Bloc enregistré');await load();
+}
+function pbDraw(){
+  $('#pb').innerHTML=PB.length?PB.map((id,i)=>`<div class="pbl"><span>${esc(id)}</span><button data-a="pb-up" data-id="${i}" aria-label="Monter">↑</button><button data-a="pb-down" data-id="${i}" aria-label="Descendre">↓</button><button data-a="pb-rm" data-id="${i}" aria-label="Retirer">×</button></div>`).join(''):'<p class="snip">Aucun bloc pour l\'instant.</p>';
+}
+function presetEdit(id){
+  const e=!!id,p=e?S.presets.find(x=>x.id===id):{};PB=[...(p.blocks||[])];
+  dialog(e?'Modifier le preset':'Nouveau preset',`<label>Identifiant<input id="f-id" value="${esc(p.id)}" ${e?'readonly':''} placeholder="portrait"></label><label>Nom<input id="f-name" value="${esc(p.name)}"></label><div><strong>Blocs, dans l'ordre</strong><div id="pb"></div></div><div class="tools"><select id="pb-sel" aria-label="Bloc à ajouter">${S.blocks.map(b=>`<option value="${b.id}">${esc(b.name||b.id)}</option>`).join('')}</select><button data-a="pb-add">Ajouter</button></div><label>Variables pour l'aperçu<input id="f-vars" placeholder="hair=silver"></label><div><button data-a="pb-prev">Aperçu du prompt</button><pre id="pv" hidden></pre></div>`,cancelBtn+`<button class="primary" data-a="preset-save" data-id="${e?id:''}">Enregistrer</button>`);
+  pbDraw();
+}
+
+/* runs */
+async function runOpen(id){
+  const r=await api('GET','/runs/'+id),fin=DONE.includes(r.status);
+  dialog('Run '+esc(r.id),`<p class="meta"><span class="st ${r.status}">${ST[r.status]}</span><span>${esc(r.workflow)} v${r.version}</span>${r.replay_of?`<span>rejoué depuis ${esc(r.replay_of)}</span>`:''}${r.batch_id?`<span>lot ${esc(r.batch_id)}</span>`:''}</p>${r.error?`<p class="err">${esc(r.error)}</p>`:''}<div class="shots">${(r.outputs||[]).map(o=>`<img data-src="/runs/${r.id}/outputs/${encodeURIComponent(o.name)}" alt="${esc(o.name)}">`).join('')}</div><details><summary>Paramètres</summary><pre>${esc(JSON.stringify(r.params,null,2))}</pre></details>${fin?`<label>Étiquettes<input id="f-tags" value="${esc((r.tags||[]).join(', '))}"></label><label>Note<textarea id="f-note" rows="2">${esc(r.note)}</textarea></label><label class="chk"><input type="checkbox" id="f-fav" ${r.favorite?'checked':''}>Favori</label>`:''}`,
+  fin?`<button class="danger" data-a="run-del" data-id="${r.id}">Supprimer</button><button data-a="run-replay" data-id="${r.id}">Rejouer</button><button data-a="run-replay" data-id="${r.id}" data-new="1">Nouvelle seed</button><button class="primary" data-a="run-save" data-id="${r.id}">Enregistrer</button>`:`<button class="danger" data-a="run-cancel" data-id="${r.id}">Annuler le run</button>${cancelBtn}`);
+}
+
+/* actions */
+async function act(a,id,el){
+  switch(a){
+    case 'tab':S.tab=id;S.q='';render();break;
+    case 'close':$('#dlg').close();break;
+    case 'wf-new':wfNew();break;
+    case 'wf-save':await wfSave();break;
+    case 'wf-open':await wfOpen(id);break;
+    case 'wf-run':await wfRun(id);break;
+    case 'wf-go':await wfGo(el);break;
+    case 'wf-check':{const c=await api('GET','/workflows/'+id+'/check');toast(c.ok?'Tous les nœuds sont installés dans ComfyUI':'Nœuds manquants : '+c.missing_nodes.join(', '),!c.ok);break}
+    case 'wf-meta':await api('PATCH','/workflows/'+id,{name:v('name'),description:$('#f-desc').value});$('#dlg').close();toast('Workflow mis à jour');await load();break;
+    case 'wf-del':if(confirm(`Supprimer le workflow « ${id} » et toutes ses versions ?`)){await api('DELETE','/workflows/'+id);toast('Workflow supprimé');await load()}break;
+    case 'block-edit':blockEdit(id);break;
+    case 'block-save':await blockSave(id);break;
+    case 'block-del':if(confirm(`Supprimer le bloc « ${id} » ?`)){await api('DELETE','/blocks/'+id);toast('Bloc supprimé');await load()}break;
+    case 'preset-edit':presetEdit(id);break;
+    case 'preset-save':{const old=id;await api(old?'PUT':'POST',old?'/presets/'+old:'/presets',{id:old||v('id'),name:v('name'),blocks:PB});$('#dlg').close();toast('Preset enregistré');await load();break}
+    case 'preset-del':if(confirm(`Supprimer le preset « ${id} » ?`)){await api('DELETE','/presets/'+id);toast('Preset supprimé');await load()}break;
+    case 'pb-add':if($('#pb-sel').value){PB.push($('#pb-sel').value);pbDraw()}break;
+    case 'pb-rm':PB.splice(+id,1);pbDraw();break;
+    case 'pb-up':case 'pb-down':{const i=+id,j=a==='pb-up'?i-1:i+1;if(j>=0&&j<PB.length){[PB[i],PB[j]]=[PB[j],PB[i]];pbDraw()}break}
+    case 'pb-prev':{const r=await api('POST','/prompts/render',{blocks:PB,vars:vars(v('vars'))});const p=$('#pv');p.hidden=false;p.textContent=r.text;break}
+    case 'run-open':await runOpen(id);break;
+    case 'run-cancel':await api('POST','/runs/'+id+'/cancel');$('#dlg').close();toast('Run annulé');await load();break;
+    case 'run-replay':await api('POST','/runs/'+id+'/replay',el.dataset.new?{new_seed:true}:{});$('#dlg').close();toast('Run relancé');await load();break;
+    case 'run-del':if(confirm('Supprimer ce run et ses images ?')){await api('DELETE','/runs/'+id);$('#dlg').close();toast('Run supprimé');await load()}break;
+    case 'run-save':await api('PATCH','/runs/'+id,{tags:tags(v('tags')),note:$('#f-note').value,favorite:$('#f-fav').checked});$('#dlg').close();toast('Run enregistré');await load();break;
+    case 'lib-export':{const r=await raw('GET','/library/export');if(!r.ok)throw new Error('Export impossible');const u=URL.createObjectURL(await r.blob()),a=document.createElement('a');a.href=u;a.download='comfyvault-library.json';a.click();URL.revokeObjectURL(u);break}
+    case 'lib-import':{const f=$('#imp-file').files[0];if(!f)return toast('Choisis un fichier d\'export.',true);
+      const r=await api('POST','/library/import'+($('#imp-ow').checked?'?overwrite=true':''),await f.text());
+      const o=$('#imp-out');o.hidden=false;o.textContent=`${r.workflow_versions} versions de workflow, ${r.blocks} blocs, ${r.presets} presets importés.`+(r.skipped.length?'\nIgnorés (déjà présents) : '+r.skipped.join(', '):'')+(r.errors.length?'\nErreurs :\n'+r.errors.join('\n'):'');
+      await load();break}
+    case 'prune':{const dry=id==='dry',days=+$('#pr-d').value;
+      if(!dry&&!confirm(`Supprimer définitivement les runs terminés de plus de ${days} jours ?`))return;
+      const r=await api('POST','/library/prune',{older_than_days:days,include_favorites:$('#pr-f').checked,dry_run:dry});
+      toast(`${dry?'Serait supprimé':'Supprimé'} : ${r.runs} runs, ${mo(r.freed_bytes)}`);if(!dry)await load();break}
+  }
+}
+document.addEventListener('click',e=>{const b=e.target.closest('[data-a]');if(b)act(b.dataset.a,b.dataset.id,b).catch(x=>toast(x.message,true))});
+document.addEventListener('input',e=>{if(e.target.id==='q'){S.q=e.target.value;list()}});
+document.addEventListener('change',e=>{if(e.target.id==='rs'){S.rs=e.target.value;list()}if(e.target.id==='rfav'){S.fav=e.target.checked;list()}});
+async function health(){try{const j=await(await fetch('/healthz')).json();S.health=j.comfyui.reachable?'up':'down'}catch{S.health='down'}rail()}
+setInterval(async()=>{
+  if(document.hidden||!S.runs.some(r=>!DONE.includes(r.status)))return;
+  try{S.runs=await api('GET','/runs?limit=200');rail();if(S.tab==='runs'&&!$('#dlg').open)list()}catch{}
+},3000);
+load().then(health).catch(e=>{$('#main').innerHTML=`<p class="err">${esc(e.message)}</p>`;toast(e.message,true)});
+</script>
+</body>
+</html>

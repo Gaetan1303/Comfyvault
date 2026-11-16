@@ -3,6 +3,7 @@ package prompt
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"sort"
 	"strconv"
@@ -71,42 +72,97 @@ func Compose(blocks []Block, vars map[string]string) (string, error) {
 // Normalize tidies a comma separated tag prompt: collapses whitespace, drops
 // empty entries, removes duplicates (case-insensitive, first one wins) and
 // writes weights canonically, so (tag:1.0) becomes tag and (tag:1.10) becomes
-// (tag:1.1). Commas inside (), [] and <> do not split.
+// (tag:1.1). Commas inside (), [] and <> do not split. When a tag appears
+// several times it keeps the position of its first occurrence and the
+// strongest emphasis (the weight farthest from 1, the higher one on a tie),
+// whatever the order: "cat, (cat:1.4)" and "(cat:1.4), cat" give the same tag.
 func Normalize(s string) string {
-	seen := map[string]bool{}
-	var out []string
+	type entry struct {
+		text string
+		w    float64
+	}
+	idx := map[string]int{}
+	var out []entry
 	for _, part := range splitTop(s) {
-		tag, key := normalizeTag(part)
-		if tag == "" || seen[key] {
+		tag, key, w := normalizeTag(part)
+		if tag == "" {
 			continue
 		}
-		seen[key] = true
-		out = append(out, tag)
+		i, seen := idx[key]
+		if !seen {
+			idx[key] = len(out)
+			out = append(out, entry{tag, w})
+			continue
+		}
+		cur := out[i]
+		if d, cd := math.Abs(w-1), math.Abs(cur.w-1); d > cd || (d == cd && w > cur.w) {
+			out[i] = entry{tag, w}
+		}
 	}
-	return strings.Join(out, ", ")
+	texts := make([]string, len(out))
+	for i, e := range out {
+		texts[i] = e.text
+	}
+	return strings.Join(texts, ", ")
 }
 
-func normalizeTag(t string) (tag, key string) {
+// normalizeTag returns the canonical tag, its deduplication key (the text
+// without weight, lowercased) and its weight (1 when it has none).
+func normalizeTag(t string) (tag, key string, weight float64) {
 	t = strings.Join(strings.Fields(t), " ")
 	if t == "" {
-		return "", ""
+		return "", "", 1
 	}
 	if m := weightRe.FindStringSubmatch(t); m != nil {
 		if w, err := strconv.ParseFloat(m[2], 64); err == nil {
 			inner := strings.TrimSpace(m[1])
 			if w == 1 {
-				return inner, strings.ToLower(inner)
+				return inner, strings.ToLower(inner), 1
 			}
-			return "(" + inner + ":" + strconv.FormatFloat(w, 'f', -1, 64) + ")", strings.ToLower(inner)
+			return "(" + inner + ":" + strconv.FormatFloat(w, 'f', -1, 64) + ")", strings.ToLower(inner), w
 		}
 	}
-	return t, strings.ToLower(t)
+	return t, strings.ToLower(t), 1
+}
+
+var closerOf = map[byte]byte{'(': ')', '[': ']', '<': '>'}
+
+// matchedBrackets returns the positions of the brackets that have a partner.
+// A lone "[" or "(" in a tag is plain text and must not swallow the commas
+// that follow it.
+func matchedBrackets(s string) map[int]bool {
+	type open struct {
+		i int
+		c byte
+	}
+	var stack []open
+	m := map[int]bool{}
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		if escaped {
+			escaped = false
+			continue
+		}
+		switch c := s[i]; c {
+		case '\\':
+			escaped = true
+		case '(', '[', '<':
+			stack = append(stack, open{i, c})
+		case ')', ']', '>':
+			if n := len(stack); n > 0 && closerOf[stack[n-1].c] == c {
+				m[stack[n-1].i], m[i] = true, true
+				stack = stack[:n-1]
+			}
+		}
+	}
+	return m
 }
 
 func splitTop(s string) []string {
 	var parts []string
 	depth, start := 0, 0
 	escaped := false
+	matched := matchedBrackets(s)
 	for i := 0; i < len(s); i++ {
 		if escaped {
 			escaped = false
@@ -116,9 +172,11 @@ func splitTop(s string) []string {
 		case '\\':
 			escaped = true
 		case '(', '[', '<':
-			depth++
+			if matched[i] {
+				depth++
+			}
 		case ')', ']', '>':
-			if depth > 0 {
+			if matched[i] && depth > 0 {
 				depth--
 			}
 		case ',':

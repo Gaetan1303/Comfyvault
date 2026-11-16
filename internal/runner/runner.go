@@ -21,7 +21,22 @@ import (
 // ErrUpstream marks failures to reach ComfyUI, as opposed to bad requests.
 var ErrUpstream = errors.New("comfyui unreachable")
 
-const maxConsecutiveFailures = 20
+const (
+	// lostAfter is how long ComfyUI may stay unreachable before a run is given
+	// up. Polling backs off up to maxBackoff meanwhile, so a restart of ComfyUI
+	// or a slow /history does not condemn jobs that are still queued there.
+	lostAfter  = 90 * time.Second
+	maxBackoff = 15 * time.Second
+	// maxOutputBytes caps a single downloaded file.
+	maxOutputBytes = 1 << 30
+)
+
+// cancelReq carries the caller's context to the goroutine doing the work, so
+// the deadline the caller sees is the deadline that really applies.
+type cancelReq struct {
+	ctx   context.Context
+	reply chan error
+}
 
 type Runner struct {
 	st      *store.Store
@@ -35,13 +50,13 @@ type Runner struct {
 	wg     sync.WaitGroup
 
 	mu      sync.Mutex
-	cancels map[string]chan chan error // run id -> cancellation requests
+	cancels map[string]chan cancelReq // run id -> cancellation requests
 }
 
 func New(st *store.Store, cl *comfy.Client, poll, timeout time.Duration, log *slog.Logger) *Runner {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Runner{st: st, cl: cl, poll: poll, timeout: timeout, log: log, ctx: ctx, cancel: cancel,
-		cancels: map[string]chan chan error{}}
+		cancels: map[string]chan cancelReq{}}
 }
 
 // Close stops all follow-up goroutines. Runs still in flight stay recorded as
@@ -102,7 +117,14 @@ func (r *Runner) SubmitWith(ctx context.Context, slug string, version int, param
 	if err != nil {
 		return store.Run{}, fmt.Errorf("%w: %v", store.ErrInvalid, err)
 	}
-	promptID, err := r.cl.Queue(ctx, g)
+	if err := ctx.Err(); err != nil {
+		return store.Run{}, err
+	}
+	// The request context only guards what happens before the job is handed to
+	// ComfyUI. Once Queue is in flight a client that hangs up must not leave a
+	// job running that nobody recorded, so it is detached from cancellation.
+	qctx := context.WithoutCancel(ctx)
+	promptID, err := r.cl.Queue(qctx, g)
 	if err != nil {
 		var ae *comfy.APIError
 		if errors.As(err, &ae) {
@@ -122,6 +144,9 @@ func (r *Runner) SubmitWith(ctx context.Context, slug string, version int, param
 		BatchID:   meta.BatchID,
 	}
 	if err := r.st.PutRun(run); err != nil {
+		if derr := r.cl.DeleteQueued(qctx, promptID); derr != nil {
+			r.log.Error("job accepted by ComfyUI but not recorded", "prompt_id", promptID, "err", err, "dequeue_err", derr)
+		}
 		return store.Run{}, err
 	}
 	r.spawn(run)
@@ -129,7 +154,7 @@ func (r *Runner) SubmitWith(ctx context.Context, slug string, version int, param
 }
 
 func (r *Runner) spawn(run store.Run) {
-	ch := make(chan chan error, 1)
+	ch := make(chan cancelReq, 1)
 	r.mu.Lock()
 	r.cancels[run.ID] = ch
 	r.mu.Unlock()
@@ -145,8 +170,9 @@ func (r *Runner) unregister(id string) {
 
 // Cancel stops a queued or running run: it is removed from ComfyUI's queue
 // or interrupted, and recorded as cancelled. The follow-up goroutine does the
-// work so that only one goroutine ever writes a run that is in flight.
-// store.ErrExists is returned when the run has already finished.
+// work, under the context given here, so that only one goroutine ever writes
+// a run that is in flight and the 15 s limit bounds the work itself, not just
+// the wait. store.ErrExists is returned when the run has already finished.
 func (r *Runner) Cancel(ctx context.Context, id string) (store.Run, error) {
 	r.mu.Lock()
 	ch, ok := r.cancels[id]
@@ -159,19 +185,19 @@ func (r *Runner) Cancel(ctx context.Context, id string) (store.Run, error) {
 		if run.Finished() {
 			return run, fmt.Errorf("%w: run %s is already %s", store.ErrExists, id, run.Status)
 		}
-		return run, fmt.Errorf("%w: run %s is not being followed by this process", store.ErrInvalid, id)
+		return run, fmt.Errorf("%w: run %s is not being followed by this process", store.ErrExists, id)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
-	reply := make(chan error, 1)
+	req := cancelReq{ctx: ctx, reply: make(chan error, 1)}
 	select {
-	case ch <- reply:
+	case ch <- req:
 	default:
 		return store.Run{}, fmt.Errorf("%w: a cancellation of run %s is already in progress", store.ErrExists, id)
 	}
 	select {
-	case err := <-reply:
+	case err := <-req.reply:
 		if err != nil {
 			return store.Run{}, err
 		}
@@ -183,10 +209,19 @@ func (r *Runner) Cancel(ctx context.Context, id string) (store.Run, error) {
 	return r.st.GetRun(id)
 }
 
+// upstream classifies an error from ComfyUI: timeouts and cancellations keep
+// their identity (the API answers 504 for them), the rest is ErrUpstream.
+func upstream(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrUpstream, err)
+}
+
 func (r *Runner) doCancel(ctx context.Context, run *store.Run) error {
 	pos, err := r.cl.Position(ctx, run.PromptID)
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUpstream, err)
+		return upstream(err)
 	}
 	switch pos {
 	case "pending":
@@ -196,14 +231,14 @@ func (r *Runner) doCancel(ctx context.Context, run *store.Run) error {
 	default:
 		entry, herr := r.cl.History(ctx, run.PromptID)
 		if herr != nil {
-			return fmt.Errorf("%w: %v", ErrUpstream, herr)
+			return upstream(herr)
 		}
 		if entry != nil && (entry.Status.Completed || entry.Status.StatusStr == "error") {
 			return fmt.Errorf("%w: run %s has already finished in ComfyUI", store.ErrExists, run.ID)
 		}
 	}
 	if err != nil {
-		return fmt.Errorf("%w: %v", ErrUpstream, err)
+		return upstream(err)
 	}
 	now := time.Now().UTC()
 	run.Status = store.StatusCancelled
@@ -216,7 +251,7 @@ func (r *Runner) doCancel(ctx context.Context, run *store.Run) error {
 	return nil
 }
 
-func (r *Runner) follow(run store.Run, cancelCh chan chan error) {
+func (r *Runner) follow(run store.Run, cancelCh chan cancelReq) {
 	defer r.wg.Done()
 	defer r.unregister(run.ID)
 	ctx, cancel := context.WithTimeout(r.ctx, r.timeout)
@@ -224,7 +259,8 @@ func (r *Runner) follow(run store.Run, cancelCh chan chan error) {
 	tick := time.NewTicker(r.poll)
 	defer tick.Stop()
 
-	failures := 0
+	failures, delay := 0, r.poll
+	var firstFailure time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -232,9 +268,15 @@ func (r *Runner) follow(run store.Run, cancelCh chan chan error) {
 				r.fail(&run, fmt.Sprintf("timed out after %s", r.timeout))
 			}
 			return
-		case reply := <-cancelCh:
-			err := r.doCancel(ctx, &run)
-			reply <- err
+		case req := <-cancelCh:
+			// Bounded by the caller's deadline, and by the run's own context
+			// so a shutdown does not wait for a slow ComfyUI.
+			cctx, ccancel := context.WithCancel(req.ctx)
+			stop := context.AfterFunc(ctx, ccancel)
+			err := r.doCancel(cctx, &run)
+			stop()
+			ccancel()
+			req.reply <- err
 			if err == nil {
 				return
 			}
@@ -244,15 +286,23 @@ func (r *Runner) follow(run store.Run, cancelCh chan chan error) {
 
 		entry, err := r.cl.History(ctx, run.PromptID)
 		if err != nil {
+			if failures == 0 {
+				firstFailure = time.Now()
+			}
 			failures++
 			r.log.Warn("history poll failed", "run", run.ID, "err", err, "consecutive", failures)
-			if failures >= maxConsecutiveFailures {
-				r.fail(&run, "lost contact with ComfyUI: "+err.Error())
+			if time.Since(firstFailure) >= lostAfter {
+				r.fail(&run, fmt.Sprintf("lost contact with ComfyUI for %s: %v", lostAfter, err))
 				return
 			}
+			delay = max(r.poll, min(delay*2, maxBackoff))
+			tick.Reset(delay)
 			continue
 		}
-		failures = 0
+		if failures > 0 {
+			failures, delay = 0, r.poll
+			tick.Reset(r.poll)
+		}
 
 		if entry == nil {
 			if run.Status == store.StatusQueued {
@@ -324,7 +374,11 @@ func (r *Runner) download(ctx context.Context, ref comfy.FileRef, dest string) e
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(tmp, rc); err != nil {
+	n, err := io.Copy(tmp, io.LimitReader(rc, maxOutputBytes+1))
+	if err == nil && n > maxOutputBytes {
+		err = fmt.Errorf("output %s is larger than %d bytes", filepath.Base(dest), int64(maxOutputBytes))
+	}
+	if err != nil {
 		tmp.Close()
 		os.Remove(tmp.Name())
 		return err

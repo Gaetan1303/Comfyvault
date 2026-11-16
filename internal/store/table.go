@@ -58,6 +58,25 @@ func (t *Table[T]) Get(id string) (T, error) {
 	return v, nil
 }
 
+// GetMany returns the values for ids, in that order, reading the file once.
+func (t *Table[T]) GetMany(ids []string) ([]T, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	m, err := t.load()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]T, 0, len(ids))
+	for _, id := range ids {
+		v, ok := m[id]
+		if !ok {
+			return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
 func (t *Table[T]) List() ([]T, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -120,5 +139,15 @@ func writeJSON(path string, v any) error {
 		os.Remove(name)
 		return err
 	}
+	syncDir(filepath.Dir(path))
 	return nil
+}
+
+// syncDir makes the rename itself durable. It is best effort: some platforms
+// cannot open or sync a directory, and the data is already safely written.
+func syncDir(dir string) {
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		d.Close()
+	}
 }

@@ -105,9 +105,10 @@ func (g Graph) ClassTypes() []string {
 
 // ValidateBindings checks that every binding points at a literal input of an
 // existing node. Several bindings may share a name (one value feeding several
-// inputs) as long as their types agree.
+// inputs) as long as their types agree, but an input can only be bound once.
 func (g Graph) ValidateBindings(bs []Binding) error {
 	types := map[string]string{}
+	targets := map[[2]string]string{} // (node, input) -> binding name
 	for i, b := range bs {
 		if !nameRe.MatchString(b.Name) {
 			return fmt.Errorf("binding %d: name %q must match %s", i, b.Name, nameRe)
@@ -121,6 +122,12 @@ func (g Graph) ValidateBindings(bs []Binding) error {
 			return fmt.Errorf("binding %q is declared with both %s and %s", b.Name, prev, b.Type)
 		}
 		types[b.Name] = b.Type
+
+		target := [2]string{b.NodeID, b.Input}
+		if prev, dup := targets[target]; dup {
+			return fmt.Errorf("binding %q: input %q of node %q is already bound by %q", b.Name, b.Input, b.NodeID, prev)
+		}
+		targets[target] = b.Name
 
 		n, ok := g[b.NodeID]
 		if !ok {
@@ -161,19 +168,18 @@ func Apply(g Graph, bs []Binding, params map[string]any) (Graph, map[string]any,
 	resolved := map[string]any{}
 	for name, b := range first {
 		v := params[name]
+		if v == nil && b.Default != nil {
+			v = b.Default // a seed default pins the seed; -1 still means "random"
+		}
 		if b.Type == TypeSeed {
 			if v == nil || isMinusOne(v) {
 				v = rand.Int64N(1 << 53)
 			}
 		} else if v == nil {
-			switch {
-			case b.Default != nil:
-				v = b.Default
-			case b.Required:
+			if b.Required {
 				return nil, nil, fmt.Errorf("parameter %q is required", name)
-			default:
-				continue
 			}
+			continue
 		}
 		cv, err := coerce(b.Type, v)
 		if err != nil {
@@ -196,6 +202,8 @@ func Apply(g Graph, bs []Binding, params map[string]any) (Graph, map[string]any,
 
 // Suggest proposes bindings for the usual suspects: the prompts feeding the
 // first sampler, its main settings, the latent size, the checkpoint and LoRAs.
+// Every further sampler (hires fix, refiner...) only gets its seed bound, under
+// the same name, so one seed value drives them all and replays stay exact.
 func Suggest(g Graph) []Binding {
 	var out []Binding
 	add := func(name, node, input, typ string, required bool) {
@@ -214,6 +222,7 @@ func Suggest(g Graph) []Binding {
 	}
 
 	ids := sortedIDs(g)
+	firstSampler := true
 	for _, id := range ids {
 		n := g[id]
 		advanced := n.ClassType == "KSamplerAdvanced"
@@ -225,6 +234,10 @@ func Suggest(g Graph) []Binding {
 			seedInput = "noise_seed"
 		}
 		add("seed", id, seedInput, TypeSeed, false)
+		if !firstSampler {
+			continue
+		}
+		firstSampler = false
 		add("steps", id, "steps", TypeInt, false)
 		add("cfg", id, "cfg", TypeFloat, false)
 		add("sampler_name", id, "sampler_name", TypeString, false)
@@ -249,7 +262,6 @@ func Suggest(g Graph) []Binding {
 				add("batch_size", src, "batch_size", TypeInt, false)
 			}
 		}
-		break
 	}
 
 	haveCkpt := false

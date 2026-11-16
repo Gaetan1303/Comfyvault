@@ -39,6 +39,7 @@ Usage:
       -older-than string  minimum age, e.g. 12h, 30d, 2w (required)
       -dry-run            only report what would be deleted
       -include-favorites  also delete runs marked as favorite
+      -force              prune even though a service answers on COMFYVAULT_LISTEN
   comfyvault version
 
 Configuration comes from the environment or a .env file; see .env.example.
@@ -103,6 +104,11 @@ func serve() error {
 		Addr:              cfg.Listen,
 		Handler:           api.New(st, cl, rn, cfg.APIKey, log).Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
+		// Bodies are capped in size; these cap how long they may take, so a
+		// client trickling bytes cannot hold a connection forever. There is no
+		// WriteTimeout on purpose: it would cut off large image downloads.
+		ReadTimeout: 2 * time.Minute,
+		IdleTimeout: 2 * time.Minute,
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -207,6 +213,7 @@ func pruneCmd(args []string) error {
 	older := fs.String("older-than", "", "minimum age of the runs to delete (12h, 30d, 2w)")
 	dry := fs.Bool("dry-run", false, "only report what would be deleted")
 	favs := fs.Bool("include-favorites", false, "also delete runs marked as favorite")
+	force := fs.Bool("force", false, "prune even though a service answers on COMFYVAULT_LISTEN")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -220,6 +227,11 @@ func pruneCmd(args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	if !*dry && !*force && serviceAnswers(cfg.Listen) {
+		// Another process writes runs under its own lock, which this one cannot
+		// take. Through the service the same pruning is race-free.
+		return fmt.Errorf("a comfyvault service answers on %s: stop it, use POST /api/v1/library/prune (or the Bibliothèque tab), or pass -force", cfg.Listen)
 	}
 	st, err := store.Open(cfg.DataDir)
 	if err != nil {
@@ -254,4 +266,19 @@ func parseAge(s string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid age %q (try 30d, 2w or 12h)", s)
 	}
 	return d, nil
+}
+
+// serviceAnswers reports whether something serves /healthz on listen.
+func serviceAnswers(listen string) bool {
+	host := listen
+	if strings.HasPrefix(host, ":") {
+		host = "127.0.0.1" + host
+	}
+	c := http.Client{Timeout: 700 * time.Millisecond}
+	resp, err := c.Get("http://" + host + "/healthz")
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	return true
 }

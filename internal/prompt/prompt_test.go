@@ -47,3 +47,32 @@ func TestCompose(t *testing.T) {
 		t.Fatal("expected missing variable error")
 	}
 }
+
+func TestNormalizeKeepsEmphasisWhateverTheOrder(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"cat, (cat:1.4)", "(cat:1.4)"},
+		{"(cat:1.4), cat", "(cat:1.4)"},
+		{"(cat:1.2), (cat:1.4)", "(cat:1.4)"},
+		{"cat, (cat:0.5)", "(cat:0.5)"},
+		{"a, (cat:1.4), b, cat", "a, (cat:1.4), b"},
+	}
+	for _, c := range cases {
+		if got := Normalize(c.in); got != c.want {
+			t.Errorf("Normalize(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestNormalizeToleratesUnbalancedBrackets(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"girl [looking away, smile, smile", "girl [looking away, smile"},
+		{"1girl, (smile, solo, solo", "1girl, (smile, solo"},
+		{"a > b, c, c", "a > b, c"},
+		{"(a, b:1.2), c, c", "(a, b:1.2), c"},
+	}
+	for _, c := range cases {
+		if got := Normalize(c.in); got != c.want {
+			t.Errorf("Normalize(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

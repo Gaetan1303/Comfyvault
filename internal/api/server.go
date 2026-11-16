@@ -20,6 +20,7 @@ import (
 	"github.com/Gaetan1303/comfyvault/internal/prompt"
 	"github.com/Gaetan1303/comfyvault/internal/runner"
 	"github.com/Gaetan1303/comfyvault/internal/store"
+	"github.com/Gaetan1303/comfyvault/internal/web"
 	"github.com/Gaetan1303/comfyvault/internal/workflow"
 )
 
@@ -39,11 +40,14 @@ func New(st *store.Store, cl *comfy.Client, rn *runner.Runner, apiKey string, lo
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.Handle("GET /{$}", web.Handler())
 	mux.HandleFunc("GET /healthz", s.health)
 
 	mux.HandleFunc("GET /api/v1/workflows", s.listWorkflows)
 	mux.HandleFunc("POST /api/v1/workflows", s.createWorkflow)
 	mux.HandleFunc("GET /api/v1/workflows/{slug}", s.getWorkflow)
+	mux.HandleFunc("PATCH /api/v1/workflows/{slug}", s.patchWorkflow)
+	mux.HandleFunc("DELETE /api/v1/workflows/{slug}", s.deleteWorkflow)
 	mux.HandleFunc("GET /api/v1/workflows/{slug}/check", s.checkWorkflow)
 	mux.HandleFunc("POST /api/v1/workflows/{slug}/run", s.runWorkflow)
 	mux.HandleFunc("POST /api/v1/workflows/{slug}/batch", s.batchWorkflow)
@@ -82,9 +86,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/runs", s.listRuns)
 	mux.HandleFunc("GET /api/v1/runs/{id}", s.getRun)
 	mux.HandleFunc("PATCH /api/v1/runs/{id}", s.patchRun)
+	mux.HandleFunc("DELETE /api/v1/runs/{id}", s.deleteRun)
 	mux.HandleFunc("POST /api/v1/runs/{id}/cancel", s.cancelRun)
 	mux.HandleFunc("POST /api/v1/runs/{id}/replay", s.replayRun)
 	mux.HandleFunc("GET /api/v1/runs/{id}/outputs/{name}", s.getOutput)
+
+	mux.HandleFunc("GET /api/v1/library/stats", s.libraryStats)
+	mux.HandleFunc("GET /api/v1/library/export", s.libraryExport)
+	mux.HandleFunc("POST /api/v1/library/import", s.libraryImport)
+	mux.HandleFunc("POST /api/v1/library/prune", s.libraryPrune)
 
 	return s.auth(mux)
 }
@@ -97,7 +107,7 @@ func (s *Server) auth(next http.Handler) http.Handler {
 	}
 	want := []byte("Bearer " + s.apiKey)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/healthz" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
+		if r.URL.Path != "/healthz" && r.URL.Path != "/" && subtle.ConstantTimeCompare([]byte(r.Header.Get("Authorization")), want) != 1 {
 			w.Header().Set("WWW-Authenticate", `Bearer realm="comfyvault"`)
 			writeError(w, http.StatusUnauthorized, "missing or invalid API key")
 			return
@@ -129,18 +139,46 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return false
 	}
+	return noTrailing(w, dec)
+}
+
+// noTrailing rejects a body with anything but whitespace after the first
+// JSON value, which Decode alone would silently ignore.
+func noTrailing(w http.ResponseWriter, dec *json.Decoder) bool {
+	if err := dec.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeError(w, http.StatusBadRequest, "invalid request body: trailing data after the JSON value")
+		return false
+	}
 	return true
+}
+
+// versionParam reads ?version=N; absent means the latest (0).
+func versionParam(w http.ResponseWriter, r *http.Request) (int, bool) {
+	raw := r.URL.Query().Get("version")
+	if raw == "" {
+		return 0, true
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		writeError(w, http.StatusBadRequest, "version must be a positive integer")
+		return 0, false
+	}
+	return n, true
 }
 
 // decodeOptional is decode for endpoints whose body may be left out.
 func decodeOptional(w http.ResponseWriter, r *http.Request, v any) bool {
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBody))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(v); err != nil && !errors.Is(err, io.EOF) {
+	err := dec.Decode(v)
+	if errors.Is(err, io.EOF) {
+		return true // no body at all
+	}
+	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request body: "+err.Error())
 		return false
 	}
-	return true
+	return noTrailing(w, dec)
 }
 
 func (s *Server) fail(w http.ResponseWriter, err error) {
@@ -165,6 +203,8 @@ func (s *Server) fail(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusUnprocessableEntity, body)
 	case errors.Is(err, runner.ErrUpstream):
 		writeError(w, http.StatusBadGateway, err.Error())
+	case errors.Is(err, context.DeadlineExceeded):
+		writeError(w, http.StatusGatewayTimeout, "timed out: "+err.Error())
 	default:
 		s.log.Error("request failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
@@ -255,7 +295,10 @@ func (s *Server) getWorkflow(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	n, _ := strconv.Atoi(r.URL.Query().Get("version"))
+	n, ok := versionParam(w, r)
+	if !ok {
+		return
+	}
 	v, ok := wf.Get(n)
 	if !ok {
 		s.fail(w, fmt.Errorf("%w: workflow %q has no version %d", store.ErrNotFound, wf.Slug, n))
@@ -288,7 +331,10 @@ func (s *Server) checkWorkflow(w http.ResponseWriter, r *http.Request) {
 		s.fail(w, err)
 		return
 	}
-	n, _ := strconv.Atoi(r.URL.Query().Get("version"))
+	n, ok := versionParam(w, r)
+	if !ok {
+		return
+	}
 	v, ok := wf.Get(n)
 	if !ok {
 		s.fail(w, fmt.Errorf("%w: workflow %q has no version %d", store.ErrNotFound, wf.Slug, n))
@@ -333,13 +379,9 @@ func (s *Server) resolvePrompt(ref promptRef) (string, error) {
 	case len(ids) == 0:
 		return "", invalid("a prompt needs a preset or a list of blocks")
 	}
-	blocks := make([]prompt.Block, 0, len(ids))
-	for _, id := range ids {
-		b, err := s.st.Blocks.Get(id)
-		if err != nil {
-			return "", err
-		}
-		blocks = append(blocks, b)
+	blocks, err := s.st.Blocks.GetMany(ids)
+	if err != nil {
+		return "", err
 	}
 	text, err := prompt.Compose(blocks, ref.Vars)
 	if err != nil {
@@ -629,9 +671,6 @@ func (s *Server) patchRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	run, err := s.st.UpdateRun(r.PathValue("id"), func(run *store.Run) error {
-		if !run.Finished() {
-			return fmt.Errorf("%w: run %s is still %s; annotate it once it has finished", store.ErrExists, run.ID, run.Status)
-		}
 		if req.Tags != nil {
 			tags, err := store.NormalizeTags(*req.Tags)
 			if err != nil {

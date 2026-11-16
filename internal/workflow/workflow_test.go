@@ -130,3 +130,59 @@ func TestSharedNameFeedsSeveralInputs(t *testing.T) {
 		t.Fatal("unexpected marshal output")
 	}
 }
+
+func TestSeedDefaultIsHonoured(t *testing.T) {
+	g := Graph{"1": {ClassType: "KSampler", Inputs: map[string]any{"seed": float64(0)}}}
+	bs := []Binding{{Name: "seed", NodeID: "1", Input: "seed", Type: TypeSeed, Default: float64(1234)}}
+	_, res, err := Apply(g, bs, nil)
+	if err != nil || res["seed"] != int64(1234) {
+		t.Fatalf("a seed default must be used when nothing is given: %v, %v", res, err)
+	}
+	_, res, _ = Apply(g, bs, map[string]any{"seed": float64(7)})
+	if res["seed"] != int64(7) {
+		t.Fatalf("an explicit seed wins over the default: %v", res)
+	}
+	_, res, _ = Apply(g, bs, map[string]any{"seed": float64(-1)})
+	if res["seed"] == int64(1234) || res["seed"] == int64(-1) {
+		t.Fatalf("-1 still means random: %v", res)
+	}
+}
+
+func TestValidateRejectsTwoNamesOnOneInput(t *testing.T) {
+	g := Graph{"3": {ClassType: "KSampler", Inputs: map[string]any{"steps": float64(20)}}}
+	err := g.ValidateBindings([]Binding{
+		{Name: "steps", NodeID: "3", Input: "steps", Type: TypeInt},
+		{Name: "etapes", NodeID: "3", Input: "steps", Type: TypeInt},
+	})
+	if err == nil || !strings.Contains(err.Error(), "already bound") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+func TestSuggestBindsTheSeedOfEverySampler(t *testing.T) {
+	sampler := func(seed, steps float64) Node {
+		return Node{ClassType: "KSampler", Inputs: map[string]any{
+			"seed": seed, "steps": steps, "cfg": float64(7), "sampler_name": "euler", "scheduler": "normal", "denoise": float64(1)}}
+	}
+	g := Graph{"1": sampler(1, 20), "2": sampler(2, 10)}
+	bs := Suggest(g)
+	seeds, steps := 0, 0
+	for _, b := range bs {
+		switch b.Name {
+		case "seed":
+			seeds++
+		case "steps":
+			steps++
+		}
+	}
+	if seeds != 2 || steps != 1 {
+		t.Fatalf("want a seed per sampler and settings for the first only, got %d seeds, %d steps: %+v", seeds, steps, bs)
+	}
+	if err := g.ValidateBindings(bs); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := Apply(g, bs, nil)
+	if err != nil || out["1"].Inputs["seed"] != out["2"].Inputs["seed"] || out["1"].Inputs["seed"] == float64(1) {
+		t.Fatalf("one seed value must drive both samplers: %v, %v", out, err)
+	}
+}
